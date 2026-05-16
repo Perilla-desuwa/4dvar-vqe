@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from q4dvar.data_loader import Lorenz96Dataset
-from q4dvar.toy_model import Array, AssimilationProblem
+from q4dvar.problem import Array, AssimilationProblem
 
 
 @dataclass(frozen=True)

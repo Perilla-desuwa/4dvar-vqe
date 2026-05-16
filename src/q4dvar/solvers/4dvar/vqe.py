@@ -10,8 +10,8 @@ from qiskit.quantum_info import SparsePauliOp, Statevector
 from qiskit_aer import AerSimulator
 from scipy.optimize import minimize
 
-from q4dvar.classical_4dvar import cost
-from q4dvar.toy_model import AssimilationProblem
+from q4dvar.problem import AssimilationProblem
+from q4dvar.solvers.classical import cost
 
 
 Array = NDArray[np.float64]

@@ -5,7 +5,7 @@ import csv
 from pathlib import Path
 
 from q4dvar.data_loader import load_lorenz96_csv
-from q4dvar.qubo_4dvar import run_sliding_window_qubo
+from q4dvar.solvers.qubo import run_sliding_window_qubo
 
 
 DEFAULT_TRAIN_PATH = Path("气象海洋/气象海洋/小规模测试/lorenz96_train.csv")
@@ -14,11 +14,12 @@ DEFAULT_OUTPUT_PATH = Path("outputs/lorenz96_train_qubo_result.csv")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run sliding-window Lorenz96 incremental QUBO 4D-Var.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_TRAIN_PATH, help="Official Lorenz96 CSV file.")
+    parser.add_argument("--input", type=Path, default=DEFAULT_TRAIN_PATH, help="Lorenz96 CSV file.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH, help="Prediction CSV output path.")
     parser.add_argument("--window", type=int, default=8, help="Number of observation times per 4D-Var window.")
     parser.add_argument("--stride", type=int, default=None, help="Window stride; defaults to window - 1.")
     parser.add_argument("--block-size", type=int, default=10, help="State dimensions per local QUBO block.")
+    parser.add_argument("--block-stride", type=int, default=None, help="Dimension stride between QUBO blocks.")
     parser.add_argument("--bits-per-dim", type=int, default=3, help="Binary variables per optimized dimension.")
     parser.add_argument("--radius", type=float, default=0.6, help="Maximum absolute increment per dimension.")
     parser.add_argument("--outer-loops", type=int, default=1, help="Number of QUBO block sweep passes per window.")
@@ -31,6 +32,7 @@ def main() -> None:
         default=0,
         help="COBYLA iterations for QAOA angle tuning; 0 uses fixed angles.",
     )
+    parser.add_argument("--quiet", action="store_true", help="Disable per-window progress logs.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for the QUBO backend.")
     args = parser.parse_args()
 
@@ -40,6 +42,7 @@ def main() -> None:
         window=args.window,
         stride=args.stride,
         block_size=args.block_size,
+        block_stride=args.block_stride,
         bits_per_dim=args.bits_per_dim,
         radius=args.radius,
         outer_loops=args.outer_loops,
@@ -48,6 +51,7 @@ def main() -> None:
         qaoa_reps=args.qaoa_reps,
         qaoa_shots=args.qaoa_shots,
         qaoa_optimizer_iterations=args.qaoa_optimizer_iterations,
+        verbose=not args.quiet,
     )
     write_prediction_csv(args.output, result.time_steps, result.analysis)
 
@@ -57,7 +61,7 @@ def main() -> None:
     print(f"output:             {args.output}")
     print(f"states:             {result.analysis.shape}")
     print(f"window/stride:      {args.window}/{args.stride or max(1, args.window - 1)}")
-    print(f"block/bits:         {args.block_size}/{args.bits_per_dim}")
+    print(f"block/stride/bits:  {args.block_size}/{args.block_stride or args.block_size}/{args.bits_per_dim}")
     print(f"solver:             {args.solver}")
     if args.solver == "qaoa":
         print(f"QAOA reps/shots:    {args.qaoa_reps}/{args.qaoa_shots}")

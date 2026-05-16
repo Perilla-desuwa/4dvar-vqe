@@ -14,7 +14,7 @@ Array = NDArray[np.float64]
 
 @dataclass(frozen=True)
 class Lorenz96Dataset:
-    """Official Lorenz96 CSV data arranged as time-by-dimension arrays."""
+    """Lorenz96 CSV data arranged as time-by-dimension arrays."""
 
     time_steps: NDArray[np.int_]
     truth: Array
@@ -35,12 +35,11 @@ class Lorenz96Dataset:
         return bool(np.isfinite(self.truth).any())
 
 
-def load_lorenz96_csv(path: str | PathLike[str], state_dim: int = 40) -> Lorenz96Dataset:
-    """Load an official Lorenz96 train/test CSV into dense arrays.
+def load_lorenz96_csv(path: str | PathLike[str], state_dim: int | None = None) -> Lorenz96Dataset:
+    """Load a long-form Lorenz96 CSV into dense arrays.
 
-    The competition files are long-form tables with one row per
-    ``time_step, dimension`` pair. Missing or blank ``true_value`` entries are
-    preserved as NaN so the same loader can be used for hidden test files.
+    If ``state_dim`` is omitted, it is inferred from the maximum dimension index
+    in the file.
     """
 
     with open(path, newline="", encoding="utf-8") as csv_file:
@@ -49,6 +48,8 @@ def load_lorenz96_csv(path: str | PathLike[str], state_dim: int = 40) -> Lorenz9
         raw_records = list(_iter_records(rows, state_dim))
     if not raw_records:
         raise ValueError(f"No Lorenz96 records found in {path}.")
+    if state_dim is None:
+        state_dim = max(record.dimension for record in raw_records) + 1
 
     time_steps = np.asarray(sorted({record.time_step for record in raw_records}), dtype=np.int_)
     time_index = {time_step: index for index, time_step in enumerate(time_steps)}
@@ -95,13 +96,13 @@ class _Record:
     observed_value: float
 
 
-def _iter_records(rows: csv.DictReader[str], state_dim: int) -> Iterable[_Record]:
+def _iter_records(rows: csv.DictReader[str], state_dim: int | None) -> Iterable[_Record]:
     has_truth = "true_value" in (rows.fieldnames or ())
 
     for line_number, row in enumerate(rows, start=2):
         time_step = _parse_int(row.get("time_step"), "time_step", line_number)
         dimension = _parse_int(row.get("dimension"), "dimension", line_number)
-        if not 0 <= dimension < state_dim:
+        if dimension < 0 or (state_dim is not None and dimension >= state_dim):
             raise ValueError(
                 f"Invalid dimension at line {line_number}: {dimension}. "
                 f"Expected 0 <= dimension < {state_dim}."
@@ -130,11 +131,6 @@ def _parse_optional_float(value: str | None) -> float:
 
 
 def _validate_complete_dimensions(time_steps: NDArray[np.int_], observed: Array, state_dim: int) -> None:
-    missing_rows = np.where(np.isnan(observed).all(axis=1))[0]
-    if len(missing_rows) > 0:
-        missing_times = ", ".join(str(int(time_steps[index])) for index in missing_rows[:5])
-        raise ValueError(f"Missing all observed values for time_step(s): {missing_times}.")
-
     incomplete = np.where(np.isnan(observed).sum(axis=1) > 0)[0]
     if len(incomplete) > 0:
         first = int(incomplete[0])

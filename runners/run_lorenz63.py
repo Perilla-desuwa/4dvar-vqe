@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from q4dvar.classical_4dvar import cost, rmse, solve_classical
+from q4dvar.models.toy import generate_lorenz63_problem
 from q4dvar.plotting import plot_state_trajectories
-from q4dvar.toy_model import generate_lorenz63_problem
+from q4dvar.solvers.classical import cost, rmse, solve_classical
 
 
 def main() -> None:

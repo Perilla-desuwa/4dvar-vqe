@@ -4,7 +4,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
-from q4dvar.toy_model import AssimilationProblem, LinearModel, propagate
+from q4dvar.models.toy import LinearModel, propagate
+from q4dvar.problem import AssimilationProblem
 
 
 Array = NDArray[np.float64]

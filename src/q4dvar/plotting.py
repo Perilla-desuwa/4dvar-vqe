@@ -4,10 +4,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy.typing import NDArray
 
-
-Array = NDArray[np.float64]
+from q4dvar.problem import Array
 
 
 def plot_state_trajectories(
@@ -62,21 +60,8 @@ def plot_phase_trajectory_comparison(
     x_dim, y_dim = dims
 
     figure, axis = plt.subplots(figsize=(8, 7))
-    axis.plot(
-        truth[:, x_dim],
-        truth[:, y_dim],
-        label="truth",
-        color="black",
-        linewidth=2.0,
-    )
-    axis.scatter(
-        observed[:, x_dim],
-        observed[:, y_dim],
-        label="observed",
-        color="tab:orange",
-        s=14,
-        alpha=0.6,
-    )
+    axis.plot(truth[:, x_dim], truth[:, y_dim], label="truth", color="black", linewidth=2.0)
+    axis.scatter(observed[:, x_dim], observed[:, y_dim], label="observed", color="tab:orange", s=14, alpha=0.6)
     axis.plot(
         background[:, x_dim],
         background[:, y_dim],
@@ -85,15 +70,46 @@ def plot_phase_trajectory_comparison(
         linestyle="--",
         linewidth=1.7,
     )
-    axis.plot(
-        analysis[:, x_dim],
-        analysis[:, y_dim],
-        label="assimilated",
-        color="tab:blue",
-        linewidth=1.8,
-    )
-
+    axis.plot(analysis[:, x_dim], analysis[:, y_dim], label="assimilated", color="tab:blue", linewidth=1.8)
     axis.scatter(truth[0, x_dim], truth[0, y_dim], color="black", s=45, marker="o", label="start")
+    axis.set_xlabel(f"x{int(x_dim)}")
+    axis.set_ylabel(f"x{int(y_dim)}")
+    axis.set_title(title)
+    axis.grid(True, alpha=0.25)
+    axis.legend(loc="best")
+    figure.tight_layout()
+    figure.savefig(output, dpi=180)
+    plt.close(figure)
+    return output
+
+
+def plot_phase_trajectories(
+    trajectories: dict[str, Array],
+    output_path: str | Path,
+    dims: tuple[int, int] = (0, 1),
+    title: str = "Lorenz96 phase trajectory comparison",
+) -> Path:
+    """Plot multiple 2D phase trajectories on one figure."""
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    x_dim, y_dim = dims
+    styles = {
+        "truth": {"color": "black", "linewidth": 2.2, "linestyle": "-"},
+        "initial": {"color": "tab:red", "linewidth": 1.7, "linestyle": "--"},
+        "baseline": {"color": "tab:green", "linewidth": 1.8, "linestyle": "-."},
+        "greedy": {"color": "tab:blue", "linewidth": 1.9, "linestyle": "-"},
+    }
+
+    figure, axis = plt.subplots(figsize=(8, 7))
+    for label, values in trajectories.items():
+        style = styles.get(label, {"linewidth": 1.6})
+        axis.plot(values[:, x_dim], values[:, y_dim], label=label, **style)
+
+    truth = trajectories.get("truth")
+    if truth is not None:
+        axis.scatter(truth[0, x_dim], truth[0, y_dim], color="black", s=45, marker="o", label="start")
+
     axis.set_xlabel(f"x{int(x_dim)}")
     axis.set_ylabel(f"x{int(y_dim)}")
     axis.set_title(title)

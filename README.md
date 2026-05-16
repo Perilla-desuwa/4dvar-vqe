@@ -1,23 +1,22 @@
 # Quantum-Assisted 4D-Var for Lorenz96
 
-This repository contains a runnable prototype for the 2026 quantum computing
-data-assimilation challenge. The current main path targets the official
-40-dimensional Lorenz96 dataset and solves a sliding-window incremental 4D-Var
-problem with local QUBO subproblems.
+This repository contains a runnable prototype for 40-dimensional Lorenz96 data
+assimilation. The current main path solves a sliding-window incremental 4D-Var
+problem with local QUBO subproblems, and includes classical reference baselines
+for comparison.
 
 The implementation is intentionally hybrid:
 
 - Lorenz96 dynamics are integrated with fixed-step RK4.
-- Official long-form CSV files are loaded into dense `time x dimension` arrays.
+- Long-form CSV files are loaded into dense `time x dimension` arrays.
 - Each 4D-Var window is linearized around the current guess trajectory.
 - A local state increment is encoded as a QUBO with at most 30 binary variables.
 - The default QUBO backend is sampled QAOA on Qiskit Aer; a greedy backend is
   kept for fast debugging and ablation.
 
-This is a working research prototype rather than a final competition system.
-The quantum part is isolated behind the QUBO solver interface so QAOA settings,
-annealing-style solvers, or a stronger optimizer can be swapped in without
-rewriting the Lorenz96 assimilation loop.
+This is a working research prototype. The quantum part is isolated behind the
+QUBO solver interface so QAOA settings, annealing-style solvers, or a stronger
+optimizer can be swapped in without rewriting the Lorenz96 assimilation loop.
 
 ## Quick Start
 
@@ -28,11 +27,10 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -e .
 ```
 
-Run the Lorenz96 sliding-window QUBO/QAOA pipeline on the provided small train
-file:
+Run the Lorenz96 sliding-window QUBO/QAOA pipeline on a local train file:
 
 ```powershell
-.\.venv\Scripts\python experiments\run_lorenz96_qubo.py `
+.\.venv\Scripts\python runners\run_lorenz96_qubo.py `
   --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
   --output "outputs\lorenz96_train_qubo_result.csv" `
   --window 6 `
@@ -43,25 +41,56 @@ file:
   --qaoa-shots 256
 ```
 
+Generate a synthetic Lorenz96 CSV with custom dimension and length:
+
+```powershell
+.\.venv\Scripts\python runners\generate_lorenz96_dataset.py `
+  --output "outputs\datasets\lorenz96_dim80_t200.csv" `
+  --state-dim 80 `
+  --n-times 200 `
+  --steps-per-obs 2 `
+  --obs-std 0.5
+```
+
 The default full-size configuration uses `10 x 3 = 30` QUBO variables per local
-block, matching the competition qubit limit. On a CPU simulator this can be
-slow, because many sampled QAOA circuits are executed across the sliding
-windows.
+block. On a CPU simulator this can be slow, because many sampled QAOA circuits
+are executed across the sliding windows.
 
 For quick debugging, use smaller local QUBOs or the greedy backend:
 
 ```powershell
-.\.venv\Scripts\python experiments\run_lorenz96_qubo.py `
+.\.venv\Scripts\python runners\run_lorenz96_qubo.py `
   --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
   --block-size 4 `
   --bits-per-dim 2 `
   --solver qaoa `
   --qaoa-shots 64
 
-.\.venv\Scripts\python experiments\run_lorenz96_qubo.py `
+.\.venv\Scripts\python runners\run_lorenz96_qubo.py `
   --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
   --solver greedy
 ```
+
+## Classical Baselines
+
+Run lightweight reference methods on the same Lorenz96 CSV:
+
+```powershell
+.\.venv\Scripts\python runners\run_lorenz96_baselines.py `
+  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --output-dir "outputs\baselines"
+```
+
+Implemented baselines:
+
+- `observed`: directly uses noisy observations as the analysis.
+- `free_run`: forecasts from the first observation without later updates.
+- `optimal_interpolation`: scalar-gain 3D-Var/OI cycling.
+- `stochastic_enkf`: a full-state stochastic ensemble Kalman filter with
+  configurable ensemble size, inflation, and observation noise.
+
+These baselines are intended to provide a local reference curve before tuning
+the QUBO/QAOA path.
 
 ## Visualization
 
@@ -70,7 +99,7 @@ contains truth, noisy observations, the unassimilated free run, and the
 assimilated trajectory.
 
 ```powershell
-.\.venv\Scripts\python experiments\plot_lorenz96_qubo_phase.py `
+.\.venv\Scripts\python runners\plot_lorenz96_qubo_phase.py `
   --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
   --output "outputs\lorenz96_qubo_phase_x0_x1.png" `
   --limit 120 `
@@ -87,15 +116,29 @@ Use `--dim-x` and `--dim-y` to plot other state dimensions.
 
 ```text
 src/q4dvar/
-  data_loader.py      official Lorenz96 CSV loader
-  lorenz96.py         Lorenz96 RK4 model and dataset-to-problem builder
-  qubo_4dvar.py       incremental 4D-Var QUBO construction and QAOA backend
-  classical_4dvar.py  classic 4D-Var cost and toy baselines
+  problem.py          shared Array, ForecastModel, AssimilationProblem types
+  data_loader.py      Lorenz96 CSV loader
   plotting.py         trajectory and phase-space plots
-  toy_model.py        shared model interface plus toy linear/Lorenz-63 models
-  quantum_vqe.py      earlier VQE demo for small toy problems
-experiments/
-  run_lorenz96_qubo.py        official-data Lorenz96 QUBO/QAOA run
+  models/
+    toy.py            toy linear and Lorenz-63 models
+    lorenz96.py       Lorenz96 RK4 model and dataset-to-problem builder
+  solvers/
+    classical.py      public wrapper for the classic 4D-Var solver
+    baselines.py      observed/free-run/OI/EnKF baselines
+    qubo.py           public wrapper for incremental QUBO 4D-Var
+    greedy.py         public wrapper for the greedy QUBO backend
+    qaoa.py           public wrapper for the sampled QAOA backend
+    vqe.py            public wrapper for the earlier VQE demo
+    4dvar/
+      classical.py    classic 4D-Var objective and solver
+      qubo.py         incremental 4D-Var QUBO construction and dispatcher
+      greedy.py       greedy QUBO backend entry point
+      qaoa.py         sampled QAOA QUBO backend entry point
+      vqe.py          VQE demo for small toy problems
+runners/
+  run_lorenz96_qubo.py        Lorenz96 QUBO/QAOA run
+  run_lorenz96_baselines.py   classical baseline runner
+  generate_lorenz96_dataset.py synthetic Lorenz96 CSV generator
   plot_lorenz96_qubo_phase.py Lorenz96 2D trajectory comparison plot
   run_demo.py                 linear model + VQE smoke test
   run_lorenz63.py             Lorenz-63 classical 4D-Var trajectory demo
@@ -103,7 +146,7 @@ experiments/
 
 ## Data Format
 
-The official CSV format is long-form:
+The expected CSV format is long-form:
 
 ```text
 time_step,dimension,true_value,observed_value
@@ -174,7 +217,8 @@ improves the original nonlinear window cost.
 
 ## Outputs
 
-`experiments/run_lorenz96_qubo.py` writes a prediction CSV:
+`runners/run_lorenz96_qubo.py` and `runners/run_lorenz96_baselines.py`
+write prediction CSVs:
 
 ```text
 time_step,dimension,predicted_value
@@ -182,7 +226,7 @@ time_step,dimension,predicted_value
 0,1,...
 ```
 
-`experiments/plot_lorenz96_qubo_phase.py` writes a PNG phase plot, usually under
+`runners/plot_lorenz96_qubo_phase.py` writes a PNG phase plot, usually under
 `outputs/`.
 
 ## Legacy Toy Demos
@@ -190,9 +234,9 @@ time_step,dimension,predicted_value
 The original toy scripts are still available:
 
 ```powershell
-.\.venv\Scripts\python experiments\run_demo.py
-.\.venv\Scripts\python experiments\run_lorenz63.py
+.\.venv\Scripts\python runners\run_demo.py
+.\.venv\Scripts\python runners\run_lorenz63.py
 ```
 
 They are useful for quick checks of the earlier VQE and classical 4D-Var code,
-but the Lorenz96 QUBO/QAOA path is the competition-oriented implementation.
+but the Lorenz96 QUBO/QAOA path is the main implementation.

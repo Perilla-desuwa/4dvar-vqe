@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "q4dvar"
+version = "0.1.0"
+description = "Minimal quantum-assisted toy 4D-Var demo using Qiskit Aer."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "qiskit",
+    "qiskit-aer",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

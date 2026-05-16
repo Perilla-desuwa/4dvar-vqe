@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 
-from q4dvar.classical_4dvar import cost, rmse, solve_classical
-from q4dvar.quantum_vqe import solve_vqe
-from q4dvar.toy_model import generate_problem
+from q4dvar.models.toy import generate_problem
+from q4dvar.solvers.classical import cost, rmse, solve_classical
+from q4dvar.solvers.vqe import solve_vqe
 
 
 def aer_backend_name() -> str:

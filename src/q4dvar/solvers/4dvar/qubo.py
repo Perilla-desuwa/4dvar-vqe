@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Literal
 
@@ -8,10 +9,10 @@ from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 from scipy.optimize import minimize
 
-from q4dvar.classical_4dvar import rmse
 from q4dvar.data_loader import Lorenz96Dataset
-from q4dvar.lorenz96 import Lorenz96Model, make_lorenz96_problem
-from q4dvar.toy_model import Array, AssimilationProblem
+from q4dvar.models.lorenz96 import Lorenz96Model, make_lorenz96_problem
+from q4dvar.problem import Array, AssimilationProblem
+from q4dvar.solvers.classical import rmse
 
 
 QuboSolverName = Literal["greedy", "qaoa"]
@@ -80,7 +81,7 @@ def build_incremental_qubo(
     """Linearize a Lorenz96 4D-Var window and encode a local increment as QUBO."""
 
     if len(dimensions) * bits_per_dim > 30:
-        raise ValueError("QUBO exceeds the 30-variable/qubit competition limit.")
+        raise ValueError("QUBO exceeds the configured 30-variable/qubit limit.")
 
     model = problem.model
     base_trajectory = model.forecast(initial_guess, len(problem.observations))
@@ -117,13 +118,17 @@ def decode_increment(qubo: QuboProblem, bits: np.ndarray) -> tuple[tuple[int, ..
     return qubo.encoding.dimensions, increment.astype(np.float64)
 
 
+
+
+
+
 def solve_qubo_greedy(
     qubo: QuboProblem,
     sweeps: int = 6,
     restarts: int = 4,
     seed: int = 0,
 ) -> QuboSolveResult:
-    """Small dependency-free QUBO optimizer used until a quantum backend is wired in."""
+    """Small dependency-free QUBO optimizer."""
 
     rng = np.random.default_rng(seed)
     best_bits = np.zeros(qubo.n_variables, dtype=np.int8)
@@ -169,7 +174,7 @@ def solve_qubo_qaoa(
     """Solve a QUBO with shallow sampled QAOA on Qiskit Aer."""
 
     if qubo.n_variables > 30:
-        raise ValueError("QAOA backend refuses QUBOs above the 30-qubit competition limit.")
+        raise ValueError("QAOA backend refuses QUBOs above the configured 30-qubit limit.")
     if reps <= 0:
         raise ValueError("reps must be positive.")
     if shots <= 0:
@@ -248,6 +253,7 @@ def solve_qubo(
 def assimilate_window_qubo(
     problem: AssimilationProblem,
     block_size: int = 10,
+    block_stride: int | None = None,
     bits_per_dim: int = 3,
     radius: float = 0.6,
     outer_loops: int = 1,
@@ -262,9 +268,10 @@ def assimilate_window_qubo(
     state = problem.background.copy()
     max_qubo_variables = 0
     rng = np.random.default_rng(seed)
+    block_starts = _block_starts(problem.background.shape[0], block_size, block_stride)
 
     for _ in range(outer_loops):
-        for start_dim in range(0, problem.background.shape[0], block_size):
+        for start_dim in block_starts:
             dimensions = tuple(range(start_dim, min(start_dim + block_size, problem.background.shape[0])))
             current_cost = _classic_window_cost(problem, state)
             qubo = build_incremental_qubo(
@@ -303,6 +310,7 @@ def run_sliding_window_qubo(
     window: int = 8,
     stride: int | None = None,
     block_size: int = 10,
+    block_stride: int | None = None,
     bits_per_dim: int = 3,
     radius: float = 0.6,
     outer_loops: int = 1,
@@ -313,20 +321,31 @@ def run_sliding_window_qubo(
     qaoa_reps: int = 1,
     qaoa_shots: int = 256,
     qaoa_optimizer_iterations: int = 0,
+    verbose: bool = True,
 ) -> SlidingAssimilationResult:
     """Run sequential sliding-window Lorenz96 QUBO assimilation over a dataset."""
 
     if stride is None:
         stride = max(1, window - 1)
+    effective_block_stride = block_size if block_stride is None else block_stride
     model = Lorenz96Model(state_dim=dataset.state_dim)
     analysis = np.full_like(dataset.observed, np.nan, dtype=np.float64)
     max_qubo_variables = 0
     rng = np.random.default_rng(seed)
+    window_starts = list(range(0, dataset.n_times, stride))
 
-    for start_index in range(0, dataset.n_times, stride):
+    for window_number, start_index in enumerate(window_starts, start=1):
         local_window = min(window, dataset.n_times - start_index)
         if local_window <= 0:
             break
+        window_started = time.perf_counter()
+        if verbose:
+            end_index = start_index + local_window
+            print(
+                f"[{solver}] window {window_number}/{len(window_starts)} "
+                f"indices={start_index}..{end_index - 1} start={start_index} length={local_window} "
+                f"block={block_size} block_stride={effective_block_stride} bits={bits_per_dim}"
+            )
 
         background = _background_for_window(dataset, analysis, start_index)
         problem = make_lorenz96_problem(
@@ -341,6 +360,7 @@ def run_sliding_window_qubo(
         result = assimilate_window_qubo(
             problem,
             block_size=block_size,
+            block_stride=block_stride,
             bits_per_dim=bits_per_dim,
             radius=radius,
             outer_loops=outer_loops,
@@ -353,6 +373,13 @@ def run_sliding_window_qubo(
         end_index = start_index + local_window
         analysis[start_index:end_index] = result.forecast[:local_window]
         max_qubo_variables = max(max_qubo_variables, result.max_qubo_variables)
+        if verbose:
+            elapsed = time.perf_counter() - window_started
+            print(
+                f"[{solver}] window {window_number}/{len(window_starts)} done "
+                f"cost={result.window_cost:.6f} max_qubo_vars={result.max_qubo_variables} "
+                f"elapsed={elapsed:.2f}s"
+            )
 
     score = None
     if dataset.has_truth:
@@ -380,6 +407,22 @@ def _finite_difference_tangent(
         trajectory = problem.model.forecast(perturbed, len(problem.observations))
         columns.append(((trajectory - base_trajectory) / eps).reshape(-1))
     return np.column_stack(columns).astype(np.float64)
+
+
+def _block_starts(state_dim: int, block_size: int, block_stride: int | None) -> list[int]:
+    if block_size <= 0:
+        raise ValueError("block_size must be positive.")
+    stride = block_size if block_stride is None else block_stride
+    if stride <= 0:
+        raise ValueError("block_stride must be positive.")
+    if block_size > state_dim:
+        return [0]
+
+    starts = list(range(0, state_dim - block_size + 1, stride))
+    final_start = state_dim - block_size
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return starts
 
 
 def _build_qaoa_circuit(matrix: Array, gammas: Array, betas: Array) -> QuantumCircuit:
