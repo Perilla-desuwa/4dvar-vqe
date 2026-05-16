@@ -11,6 +11,7 @@ from q4dvar.problem import Array, AssimilationProblem
 from q4dvar.solvers.classical import rmse
 
 from .qubo import (
+    BlockSelectionName,
     QuboEncoding,
     QuboProblem,
     QuboSolverName,
@@ -18,9 +19,10 @@ from .qubo import (
     WindowAssimilationResult,
     _background_for_window,
     _binary_transform,
-    _block_starts,
     _classic_window_cost,
+    _format_dimensions,
     _make_encoding,
+    _select_dimension_blocks,
     _to_upper_qubo,
     solve_qubo,
 )
@@ -123,6 +125,7 @@ def assimilate_window_second_order_qubo(
     problem: AssimilationProblem,
     block_size: int = 3,
     block_stride: int | None = None,
+    block_selection: BlockSelectionName = "cyclic",
     bits_per_dim: int = 2,
     radius: float = 0.4,
     outer_loops: int = 1,
@@ -131,19 +134,32 @@ def assimilate_window_second_order_qubo(
     penalty_strength: float = 20.0,
     finite_difference_eps: float = 1e-3,
     qaoa_reps: int = 1,
-    qaoa_shots: int = 256,
-    qaoa_optimizer_iterations: int = 0,
+    qaoa_shots: int = 512,
+    qaoa_optimizer_iterations: int = 20,
+    verbose: bool = False,
 ) -> WindowAssimilationResult:
     """Optimize one window using second-order incremental QUBO blocks."""
 
     state = problem.background.copy()
     max_qubo_variables = 0
     rng = np.random.default_rng(seed)
-    block_starts = _block_starts(problem.background.shape[0], block_size, block_stride)
 
-    for _ in range(outer_loops):
-        for start_dim in block_starts:
-            dimensions = tuple(range(start_dim, min(start_dim + block_size, problem.background.shape[0])))
+    for outer_index in range(outer_loops):
+        blocks = _select_dimension_blocks(
+            problem,
+            state,
+            block_size=block_size,
+            block_stride=block_stride,
+            block_selection=block_selection,
+            finite_difference_eps=finite_difference_eps,
+        )
+        for block_number, dimensions in enumerate(blocks, start=1):
+            if verbose:
+                print(
+                    f"[second-order-{solver}]   outer {outer_index + 1}/{outer_loops} "
+                    f"block {block_number}/{len(blocks)} selection={block_selection} "
+                    f"dims={_format_dimensions(dimensions)}"
+                )
             current_cost = _classic_window_cost(problem, state)
             second_order = build_second_order_incremental_qubo(
                 problem,
@@ -166,8 +182,18 @@ def assimilate_window_second_order_qubo(
             selected_dims, increment = decode_second_order_increment(second_order, solved.bits)
             candidate = state.copy()
             candidate[list(selected_dims)] += increment
-            if _classic_window_cost(problem, candidate) <= current_cost:
+            candidate_cost = _classic_window_cost(problem, candidate)
+            accepted = candidate_cost <= current_cost
+            if accepted:
                 state = candidate
+            if verbose:
+                status = "accepted" if accepted else "rejected"
+                print(
+                    f"[second-order-{solver}]   block {block_number}/{len(blocks)} {status} "
+                    f"dims={_format_dimensions(selected_dims)} "
+                    f"cost={current_cost:.6f}->{candidate_cost:.6f} "
+                    f"qubo_vars={second_order.qubo.n_variables}"
+                )
 
     forecast = problem.model.forecast(state, len(problem.observations))
     return WindowAssimilationResult(
@@ -184,9 +210,11 @@ def run_sliding_window_second_order_qubo(
     stride: int | None = None,
     block_size: int = 3,
     block_stride: int | None = None,
+    block_selection: BlockSelectionName = "cyclic",
     bits_per_dim: int = 2,
     radius: float = 0.4,
     outer_loops: int = 1,
+    time_sweeps: int = 1,
     background_std: float = 1.0,
     observation_std: float = 0.5,
     seed: int = 0,
@@ -194,12 +222,14 @@ def run_sliding_window_second_order_qubo(
     penalty_strength: float = 20.0,
     finite_difference_eps: float = 1e-3,
     qaoa_reps: int = 1,
-    qaoa_shots: int = 256,
-    qaoa_optimizer_iterations: int = 0,
+    qaoa_shots: int = 512,
+    qaoa_optimizer_iterations: int = 20,
     verbose: bool = True,
 ) -> SlidingAssimilationResult:
     """Run sliding-window second-order QUBO assimilation over a dataset."""
 
+    if time_sweeps <= 0:
+        raise ValueError("time_sweeps must be positive.")
     if stride is None:
         stride = max(1, window - 1)
     effective_block_stride = block_size if block_stride is None else block_stride
@@ -209,54 +239,65 @@ def run_sliding_window_second_order_qubo(
     rng = np.random.default_rng(seed)
     window_starts = list(range(0, dataset.n_times, stride))
 
-    for window_number, start_index in enumerate(window_starts, start=1):
-        local_window = min(window, dataset.n_times - start_index)
-        if local_window <= 0:
-            break
-        window_started = time.perf_counter()
+    for time_sweep in range(time_sweeps):
         if verbose:
-            end_index = start_index + local_window
             print(
-                f"[second-order-{solver}] window {window_number}/{len(window_starts)} "
-                f"indices={start_index}..{end_index - 1} start={start_index} length={local_window} "
-                f"block={block_size} block_stride={effective_block_stride} bits={bits_per_dim}"
+                f"[second-order-{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
+                f"windows={len(window_starts)}"
             )
+        for window_number, start_index in enumerate(window_starts, start=1):
+            local_window = min(window, dataset.n_times - start_index)
+            if local_window <= 0:
+                break
+            window_started = time.perf_counter()
+            if verbose:
+                end_index = start_index + local_window
+                print(
+                    f"[second-order-{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
+                    f"window {window_number}/{len(window_starts)} "
+                    f"indices={start_index}..{end_index - 1} start={start_index} length={local_window} "
+                    f"block={block_size} block_stride={effective_block_stride} "
+                    f"block_selection={block_selection} bits={bits_per_dim}"
+                )
 
-        background = _background_for_window(dataset, analysis, start_index)
-        assim_problem = make_lorenz96_problem(
-            dataset,
-            start_index=start_index,
-            window=local_window,
-            background=background,
-            background_std=background_std,
-            observation_std=observation_std,
-            model=model,
-        )
-        result = assimilate_window_second_order_qubo(
-            assim_problem,
-            block_size=block_size,
-            block_stride=block_stride,
-            bits_per_dim=bits_per_dim,
-            radius=radius,
-            outer_loops=outer_loops,
-            seed=int(rng.integers(0, 2**31 - 1)),
-            solver=solver,
-            penalty_strength=penalty_strength,
-            finite_difference_eps=finite_difference_eps,
-            qaoa_reps=qaoa_reps,
-            qaoa_shots=qaoa_shots,
-            qaoa_optimizer_iterations=qaoa_optimizer_iterations,
-        )
-        end_index = start_index + local_window
-        analysis[start_index:end_index] = result.forecast[:local_window]
-        max_qubo_variables = max(max_qubo_variables, result.max_qubo_variables)
-        if verbose:
-            elapsed = time.perf_counter() - window_started
-            print(
-                f"[second-order-{solver}] window {window_number}/{len(window_starts)} done "
-                f"cost={result.window_cost:.6f} max_qubo_vars={result.max_qubo_variables} "
-                f"elapsed={elapsed:.2f}s"
+            background = _background_for_window(dataset, analysis, start_index)
+            assim_problem = make_lorenz96_problem(
+                dataset,
+                start_index=start_index,
+                window=local_window,
+                background=background,
+                background_std=background_std,
+                observation_std=observation_std,
+                model=model,
             )
+            result = assimilate_window_second_order_qubo(
+                assim_problem,
+                block_size=block_size,
+                block_stride=block_stride,
+                block_selection=block_selection,
+                bits_per_dim=bits_per_dim,
+                radius=radius,
+                outer_loops=outer_loops,
+                seed=int(rng.integers(0, 2**31 - 1)),
+                solver=solver,
+                penalty_strength=penalty_strength,
+                finite_difference_eps=finite_difference_eps,
+                qaoa_reps=qaoa_reps,
+                qaoa_shots=qaoa_shots,
+                qaoa_optimizer_iterations=qaoa_optimizer_iterations,
+                verbose=verbose,
+            )
+            end_index = start_index + local_window
+            analysis[start_index:end_index] = result.forecast[:local_window]
+            max_qubo_variables = max(max_qubo_variables, result.max_qubo_variables)
+            if verbose:
+                elapsed = time.perf_counter() - window_started
+                print(
+                    f"[second-order-{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
+                    f"window {window_number}/{len(window_starts)} done "
+                    f"cost={result.window_cost:.6f} max_qubo_vars={result.max_qubo_variables} "
+                    f"elapsed={elapsed:.2f}s"
+                )
 
     score = None
     if dataset.has_truth:

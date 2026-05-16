@@ -37,10 +37,12 @@ Run the Lorenz96 sliding-window QUBO/QAOA pipeline on a local train file:
   --output "outputs\lorenz96_train_qubo_result.csv" `
   --window 6 `
   --block-size 10 `
+  --block-selection hessian `
   --bits-per-dim 3 `
   --radius 0.4 `
   --solver qaoa `
-  --qaoa-shots 256
+  --qaoa-shots 512 `
+  --qaoa-optimizer-iterations 20
 ```
 
 Generate a synthetic Lorenz96 CSV with custom dimension and length:
@@ -58,6 +60,12 @@ The default full-size configuration uses `10 x 3 = 30` QUBO variables per local
 block. On a CPU simulator this can be slow, because many sampled QAOA circuits
 are executed across the sliding windows.
 
+Block selection can be changed with `--block-selection`:
+
+- `cyclic`: fixed coordinate-order blocks, the original baseline.
+- `gradient`: active blocks built from the largest local 4D-Var gradient entries.
+- `hessian`: gradient-seeded blocks expanded by the strongest local Hessian couplings.
+
 For quick debugging, use smaller local QUBOs or the greedy backend:
 
 ```powershell
@@ -66,7 +74,8 @@ For quick debugging, use smaller local QUBOs or the greedy backend:
   --block-size 4 `
   --bits-per-dim 2 `
   --solver qaoa `
-  --qaoa-shots 64
+  --qaoa-shots 128 `
+  --qaoa-optimizer-iterations 5
 
 .\.venv\Scripts\python runners\run_lorenz96_qubo.py `
   --input "\lorenz96_train.csv" `
@@ -222,8 +231,9 @@ min_q q^T Q q + const, q in {0, 1}^n
 
 With the default `block_size=10` and `bits_per_dim=3`, each QUBO uses exactly
 30 binary variables. The QAOA backend converts `Q` to Ising `Z` and `ZZ` terms,
-runs a shallow sampled QAOA circuit on Aer, and accepts an increment only if it
-improves the original nonlinear window cost.
+runs a shallow sampled QAOA circuit on Aer, tunes the QAOA angles with a small
+COBYLA loop by default, and accepts an increment only if it improves the
+original nonlinear window cost.
 
 The experimental second-order path replaces the linearized forecast with:
 
@@ -242,13 +252,17 @@ nonlinearity at the cost of many more variables, so it is intended for small
 - `--window`: number of observation times in one 4D-Var window.
 - `--stride`: step between windows; defaults to `window - 1`.
 - `--block-size`: number of state dimensions optimized per QUBO block.
+- `--block-selection`: `cyclic`, `gradient`, or `hessian` dimension selection.
 - `--bits-per-dim`: binary resolution per state dimension.
 - `--radius`: maximum local increment magnitude encoded by the QUBO grid.
+- `--time-sweeps`: number of full passes over all sliding windows. The default
+  is `1`; larger values reuse the previous full analysis as the next sweep's
+  window background.
 - `--solver`: `qaoa` for the quantum path, `greedy` for fast debugging.
 - `--qaoa-reps`: QAOA depth `p`.
-- `--qaoa-shots`: shots per sampled QAOA circuit.
-- `--qaoa-optimizer-iterations`: optional COBYLA tuning of QAOA angles. `0`
-  uses fixed angles, which is much faster for end-to-end runs.
+- `--qaoa-shots`: shots per sampled QAOA circuit. The default is `512`.
+- `--qaoa-optimizer-iterations`: COBYLA tuning iterations for QAOA angles. The
+  default is `20`; set it to `0` to use fixed angles for faster debugging.
 - `--penalty-strength`: second-order runner only; enforces auxiliary
   `p_ij = q_i q_j` consistency.
 - `--finite-difference-eps`: second-order runner only; step size for estimating

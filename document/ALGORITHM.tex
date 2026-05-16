@@ -27,7 +27,7 @@
   columns=fullflexible
 }
 
-\title{Lorenz96 的量子辅助增量 4D-Var 方法说明}
+\title{基于块坐标下降的Lorenz96模型的四维量子变分数据同化算法}
 \author{}
 \date{\today}
 
@@ -321,18 +321,7 @@ for outer_loop in 1..N:
         accept increment only if nonlinear window cost decreases
 \end{lstlisting}
 
-其中 \texttt{block\_stride} 可以小于 \texttt{block\_size}，从而产生重叠 block。例如：
-\begin{equation}
-  \mathrm{block\_size}=10,
-  \qquad
-  \mathrm{block\_stride}=5,
-\end{equation}
-对应的 block 为
-\begin{equation}
-  0..9,\quad 5..14,\quad 10..19,\quad \ldots
-\end{equation}
-
-重叠 block 可以减轻硬切分状态维度带来的边界效应，也更适合 Lorenz96 这类局部耦合系统。
+其中 \texttt{block\_stride} 可以小于 \texttt{block\_size}，从而产生重叠 block。
 
 时间窗口的作用是引入动力学一致性。若不使用窗口，而只在单个时刻拟合观测，则目标函数主要退化为对观测噪声的平滑，无法保证所得状态序列由 Lorenz96 方程产生。使用窗口后，算法优化的是窗口初始状态，后续所有时刻的状态都由模型传播得到，因此窗口内整条轨迹需要同时解释多时刻观测。
 
@@ -340,7 +329,7 @@ for outer_loop in 1..N:
 
 当前实现中，窗口结果会写入对应的分析场区间；若窗口重叠，后一个窗口会覆盖重叠位置。后续可以进一步改进为重叠区域加权平均，以减少窗口边界处的不连续。
 
-\subsection{优化维度选择}
+\subsection{块坐标下降的优化维度选择}
 
 优化维度选择由 \texttt{block\_size} 和 \texttt{block\_stride} 控制。设状态维度为 $d$，每个 block 覆盖 \texttt{block\_size} 个连续维度。若 \texttt{block\_stride = block\_size}，则不同 block 互不重叠；若 \texttt{block\_stride < block\_size}，则相邻 block 发生重叠。
 
@@ -356,18 +345,35 @@ for outer_loop in 1..N:
 \end{equation}
 此时每个内部维度会在多个 block 中被重复优化。对于 Lorenz96 这种邻域耦合模型，重叠 block 通常更自然，因为某个维度的变化会通过动力学项影响其相邻维度。重叠 block 不会增加单次 QUBO 的变量数，但会增加一个窗口内 QUBO 子问题的数量。
 
-当前实现还支持 \texttt{outer\_loops}，即在同一个时间窗口内反复 sweep 所有 block。这样做相当于 block-coordinate descent 的多轮迭代：第一轮得到粗略修正，后续轮次在更新后的状态附近继续修正。一般来说，\texttt{outer\_loops=2} 或 3 可能带来收益，但计算量也会相应增加。
+当前实现还支持两类 sweep。第一类是 \texttt{outer\_loops}，即在同一个时间窗口内反复 sweep 所有 block。这样做相当于 block-coordinate descent 的多轮迭代：第一轮得到粗略修正，后续轮次在更新后的状态附近继续修正。第二类是 \texttt{time\_sweeps}，即在完成一次从前到后的所有时间窗口同化后，再用上一轮完整分析场作为背景，从第一个窗口重新开始新一轮时间 sweep。前者强化单个窗口内的局部收敛，后者让较晚窗口的信息在下一轮中间接影响较早窗口的初值修正。一般来说，\texttt{outer\_loops=2} 或 3、\texttt{time\_sweeps=1} 或 2 可以作为起点；继续增大二者会线性增加 QUBO 调用次数。
+
+除固定顺序的 cyclic block 外，当前实现还加入了两种可开关的自适应 block 选择策略，由 \texttt{block\_selection} 控制：
+\begin{itemize}
+  \item \texttt{cyclic}：默认策略，按坐标顺序切分 block，等价于普通 cyclic block coordinate descent；
+  \item \texttt{gradient}：先在当前窗口和当前状态附近构造一阶增量模型，计算局部梯度 $g$，优先选择 $|g_i|$ 最大的维度进入 QUBO block；
+  \item \texttt{hessian}：以 $|g_i|$ 最大的维度作为种子，再利用近似 Hessian
+  \begin{equation}
+    A \approx B^{-1} + T^{\top} R^{-1} T
+  \end{equation}
+  定义变量耦合强度，将与种子及已选维度耦合最强的变量加入同一个 block。
+\end{itemize}
+
+这两种自适应策略对应了 active coordinate selection 和 Hessian-induced coupling graph 的思想。前者把量子调用集中在当前最可能降低代价函数的坐标上；后者进一步考虑 4D-Var Hessian 中的变量相互作用，尽量把强耦合变量放入同一个 QUBO 子问题。在固定量子比特预算下，这相当于让每次 QUBO 调用优先覆盖“误差大且相互影响强”的局部子空间，而不是机械地扫描坐标顺序。
 
 综合来看，优化维度选择需要在以下三者之间平衡：
 \begin{itemize}
   \item 单次 QUBO 变量数：由 \texttt{block\_size} 和 \texttt{bits\_per\_dim} 决定；
   \item 状态耦合覆盖：由 \texttt{block\_stride} 决定；
-  \item 计算时间：由 block 数量、窗口数和 \texttt{outer\_loops} 共同决定。
+  \item 计算时间：由 block 数量、窗口数、\texttt{outer\_loops} 和 \texttt{time\_sweeps} 共同决定。
 \end{itemize}
 
 \subsection{QAOA 后端}
 
-QAOA 后端会将 QUBO 转换为 Ising 哈密顿量。对二进制变量 $q_i$，使用映射
+QAOA（Quantum Approximate Optimization Algorithm）可以看作一种面向组合优化问题的变分量子算法。它的思想与退火类算法有相通之处：模拟退火通过温度调度在能量景观中随机搜索，量子退火通过横场哈密顿量逐渐变形到目标哈密顿量，而 QAOA 则把这种“从容易制备的初态逐步偏向低能量态”的过程离散成有限层参数化量子线路。与模拟退火不同，QAOA 的搜索分布由量子线路和测量采样给出；与连续量子退火不同，QAOA 的演化时间被分解为若干可优化的角度参数。
+
+从变分算法角度看，QAOA 与 VQE 有共同框架：二者都先定义一个参数化量子态 $|\psi(\theta)\rangle$，再通过经典优化器最小化某个期望能量。VQE 通常面向量子化学或一般哈密顿量基态问题，ansatz 可以是硬件高效线路或物理启发线路；QAOA 则是专门针对 Ising/QUBO 等组合优化问题设计的结构化 ansatz，其参数通常写作代价角 $\gamma$ 和混合角 $\beta$。因此，在本文中 QAOA 是比早期 VQE toy demo 更贴合 QUBO 子问题的后端。
+
+QAOA 后端首先会将 QUBO 转换为 Ising 哈密顿量。对二进制变量 $q_i$，使用映射
 \begin{equation}
   q_i = \frac{1 - z_i}{2}.
 \end{equation}
@@ -403,7 +409,7 @@ QAOA 电路在代价演化和混合演化之间交替：
   |+\rangle^{\otimes n}.
 \end{equation}
 
-实现中使用 Qiskit Aer 对线路采样，并从采样得到的 bitstring 中选择 QUBO 能量最低的解。代码也支持用 COBYLA 调整 QAOA 角度；不过在端到端大规模实验中，固定浅层角度通常更快。
+实现中使用 Qiskit Aer 对线路采样，并从采样得到的 bitstring 中选择 QUBO 能量最低的解。默认配置采用 $p=1$ 的浅层 QAOA，但不再只使用固定角度，而是用 COBYLA 对 $(\gamma,\beta)$ 做少量变分优化。当前默认参数为 shots = 512、优化迭代次数 = 20；如果需要更快的端到端调试，可以把优化迭代次数设为 0，此时退化为固定角度采样。若要提高 QAOA 解质量，可以优先增加 shots 和优化迭代次数，再谨慎增加 QAOA 层数 $p$，因为 $p$ 增大会显著增加线路深度和经典外层优化成本。
 
 \subsection{非线性代价接受准则}
 
@@ -466,6 +472,79 @@ outputs/lorenz96_baseline_solver_x0_x1.png
   \caption{真实轨迹、初始自由积分、经典 baseline 与 QUBO 辅助分析轨迹的二维相图对比}
 \end{figure}
 
+进一步地，本文在 \texttt{lorenz96\_test\_1.csv} 上进行了两组额外对比实验。实验使用前 120 个观测时刻、Greedy QUBO 后端，后端可通过脚本参数切换为 QAOA。第一组比较一阶增量 QUBO 与二阶增量 QUBO，并固定每维 3 个二进制变量以控制二阶辅助变量数量；第二组比较 \texttt{cyclic}、\texttt{gradient}、\texttt{hessian} 三种 block 选择策略，并使用当前 block 对比参数。
+
+\subsection{一阶与二阶增量 QUBO 对比}
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lcc}
+    \toprule
+    方法 & RMSE & 误差能量 \\
+    \midrule
+    Linear QUBO & 0.207946 & 0.021621 \\
+    2nd-order QUBO & 0.206088 & 0.021236 \\
+    \bottomrule
+  \end{tabular}
+  \caption{一阶与二阶增量 QUBO 对比。该组实验使用 \texttt{order\_bits\_per\_dim=3}，误差能量定义为 $0.5\,\mathrm{mean}((x_a-x_t)^2)$。}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \IfFileExists{../outputs/figures/lorenz96_test_1_linear_vs_second_order_trajectory.png}{
+    \includegraphics[width=0.82\linewidth]{../outputs/figures/lorenz96_test_1_linear_vs_second_order_trajectory.png}
+  }{
+    \fbox{\parbox{0.75\linewidth}{未找到图片：../outputs/figures/lorenz96\_test\_1\_linear\_vs\_second\_order\_trajectory.png}}
+  }
+  \caption{一阶增量 QUBO 与二阶增量 QUBO 的二维轨迹对比}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \IfFileExists{../outputs/figures/lorenz96_test_1_linear_vs_second_order_energy.png}{
+    \includegraphics[width=0.82\linewidth]{../outputs/figures/lorenz96_test_1_linear_vs_second_order_energy.png}
+  }{
+    \fbox{\parbox{0.75\linewidth}{未找到图片：../outputs/figures/lorenz96\_test\_1\_linear\_vs\_second\_order\_energy.png}}
+  }
+  \caption{一阶增量 QUBO 与二阶增量 QUBO 的 RMSE 与误差能量柱状图}
+\end{figure}
+
+\subsection{Block 选择策略对比}
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lcc}
+    \toprule
+    方法 & RMSE & 误差能量 \\
+    \midrule
+    Cyclic block & 0.209731 & 0.021994 \\
+    Gradient block & 0.194627 & 0.018940 \\
+    Hessian block & 0.204548 & 0.020920 \\
+    \bottomrule
+  \end{tabular}
+  \caption{三种 block 选择策略对比。该组实验使用 \texttt{bits\_per\_dim=4}。}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \IfFileExists{../outputs/figures/lorenz96_test_1_block_selection_trajectory.png}{
+    \includegraphics[width=0.82\linewidth]{../outputs/figures/lorenz96_test_1_block_selection_trajectory.png}
+  }{
+    \fbox{\parbox{0.75\linewidth}{未找到图片：../outputs/figures/lorenz96\_test\_1\_block\_selection\_trajectory.png}}
+  }
+  \caption{三种 block 选择策略的二维轨迹对比}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \IfFileExists{../outputs/figures/lorenz96_test_1_block_selection_energy.png}{
+    \includegraphics[width=0.82\linewidth]{../outputs/figures/lorenz96_test_1_block_selection_energy.png}
+  }{
+    \fbox{\parbox{0.75\linewidth}{未找到图片：../outputs/figures/lorenz96\_test\_1\_block\_selection\_energy.png}}
+  }
+  \caption{三种 block 选择策略的 RMSE 与误差能量柱状图}
+\end{figure}
+
 \section{复现实验}
 
 安装依赖：
@@ -513,7 +592,8 @@ python -m venv .venv
   --radius 0.4 `
   --solver qaoa `
   --qaoa-reps 1 `
-  --qaoa-shots 256
+  --qaoa-shots 512 `
+  --qaoa-optimizer-iterations 20
 \end{lstlisting}
 
 生成对比图：
@@ -530,6 +610,19 @@ python -m venv .venv
   --block-stride 5 `
   --bits-per-dim 3
 \end{lstlisting}
+
+运行本文中的 QUBO 变体与 block 选择对比实验：
+\begin{lstlisting}[style=cmd]
+.\.venv\Scripts\python runners\compare_lorenz96_qubo_variants.py `
+  --input "气象海洋\气象海洋\小规模测试\lorenz96_test_1.csv" `
+  --output-dir "outputs\figures" `
+  --limit 120 `
+  --bits-per-dim 4 `
+  --order-bits-per-dim 3 `
+  --solver greedy
+\end{lstlisting}
+
+若要将同一实验切换为 QAOA 后端，只需将 \texttt{--solver greedy} 改为 \texttt{--solver qaoa}，并根据可接受的运行时间调整 QAOA shots 与优化迭代次数。
 
 \section{总结}
 

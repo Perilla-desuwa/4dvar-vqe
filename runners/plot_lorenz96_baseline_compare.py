@@ -39,9 +39,16 @@ def main() -> None:
     parser.add_argument("--stride", type=int, default=None, help="Window stride; defaults to window - 1.")
     parser.add_argument("--block-size", type=int, default=10, help="State dimensions per local QUBO block.")
     parser.add_argument("--block-stride", type=int, default=None, help="Dimension stride between QUBO blocks.")
+    parser.add_argument(
+        "--block-selection",
+        choices=["cyclic", "gradient", "hessian"],
+        default="cyclic",
+        help="Policy for selecting QUBO state-dimension blocks.",
+    )
     parser.add_argument("--bits-per-dim", type=int, default=3, help="Binary variables per optimized dimension.")
     parser.add_argument("--radius", type=float, default=0.4, help="Maximum absolute increment per dimension.")
-    parser.add_argument("--outer-loops", type=int, default=5, help="Number of QUBO block sweep passes per window.")
+    parser.add_argument("--block-passes", type=int, default=5, help="Number of QUBO block sweep passes per window.")
+    parser.add_argument("--time-sweeps", type=int, default=3, help="Number of full passes over all time windows.")
     parser.add_argument("--ensemble-size", type=int, default=80, help="EnKF ensemble size if --baseline enkf.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--quiet", action="store_true", help="Disable per-window progress logs.")
@@ -63,9 +70,11 @@ def main() -> None:
         stride=args.stride,
         block_size=args.block_size,
         block_stride=args.block_stride,
+        block_selection=args.block_selection,
         bits_per_dim=args.bits_per_dim,
         radius=args.radius,
-        outer_loops=args.outer_loops,
+        outer_loops=args.block_passes,
+        time_sweeps=args.time_sweeps,
         seed=args.seed,
         solver=args.solver,
         verbose=not args.quiet,

@@ -20,18 +20,25 @@ def main() -> None:
     parser.add_argument("--stride", type=int, default=None, help="Window stride; defaults to window - 1.")
     parser.add_argument("--block-size", type=int, default=3, help="State dimensions per local second-order QUBO.")
     parser.add_argument("--block-stride", type=int, default=None, help="Dimension stride between QUBO blocks.")
+    parser.add_argument(
+        "--block-selection",
+        choices=["cyclic", "gradient", "hessian"],
+        default="cyclic",
+        help="Policy for selecting QUBO state-dimension blocks.",
+    )
     parser.add_argument("--bits-per-dim", type=int, default=2, help="Binary variables per optimized dimension.")
     parser.add_argument("--radius", type=float, default=0.4, help="Maximum absolute increment per dimension.")
     parser.add_argument("--outer-loops", type=int, default=1, help="Number of QUBO block sweep passes per window.")
+    parser.add_argument("--time-sweeps", type=int, default=3, help="Number of full passes over all time windows.")
     parser.add_argument("--solver", choices=["qaoa", "greedy"], default="greedy", help="QUBO backend.")
     parser.add_argument("--penalty-strength", type=float, default=20.0, help="Auxiliary product penalty strength.")
     parser.add_argument("--finite-difference-eps", type=float, default=1e-3, help="Second-order finite difference step.")
     parser.add_argument("--qaoa-reps", type=int, default=1, help="QAOA depth p.")
-    parser.add_argument("--qaoa-shots", type=int, default=256, help="Shots per QAOA circuit.")
+    parser.add_argument("--qaoa-shots", type=int, default=512, help="Shots per QAOA circuit.")
     parser.add_argument(
         "--qaoa-optimizer-iterations",
         type=int,
-        default=0,
+        default=20,
         help="COBYLA iterations for QAOA angle tuning; 0 uses fixed angles.",
     )
     parser.add_argument("--quiet", action="store_true", help="Disable per-window progress logs.")
@@ -45,9 +52,11 @@ def main() -> None:
         stride=args.stride,
         block_size=args.block_size,
         block_stride=args.block_stride,
+        block_selection=args.block_selection,
         bits_per_dim=args.bits_per_dim,
         radius=args.radius,
         outer_loops=args.outer_loops,
+        time_sweeps=args.time_sweeps,
         seed=args.seed,
         solver=args.solver,
         penalty_strength=args.penalty_strength,
@@ -65,11 +74,14 @@ def main() -> None:
     print(f"output:             {args.output}")
     print(f"states:             {result.analysis.shape}")
     print(f"window/stride:      {args.window}/{args.stride or max(1, args.window - 1)}")
+    print(f"time sweeps:        {args.time_sweeps}")
     print(f"block/stride/bits:  {args.block_size}/{args.block_stride or args.block_size}/{args.bits_per_dim}")
+    print(f"block selection:    {args.block_selection}")
     print(f"solver:             {args.solver}")
     print(f"penalty strength:   {args.penalty_strength}")
     if args.solver == "qaoa":
         print(f"QAOA reps/shots:    {args.qaoa_reps}/{args.qaoa_shots}")
+        print(f"QAOA opt iters:     {args.qaoa_optimizer_iterations}")
     print(f"max QUBO variables: {result.max_qubo_variables}")
     if result.rmse_vs_truth is not None:
         print(f"RMSE vs truth:      {result.rmse_vs_truth:.6f}")

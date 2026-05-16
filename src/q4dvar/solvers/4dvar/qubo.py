@@ -16,6 +16,7 @@ from q4dvar.solvers.classical import rmse
 
 
 QuboSolverName = Literal["greedy", "qaoa"]
+BlockSelectionName = Literal["cyclic", "gradient", "hessian"]
 
 
 @dataclass(frozen=True)
@@ -232,8 +233,8 @@ def solve_qubo(
     solver: QuboSolverName = "qaoa",
     seed: int = 0,
     qaoa_reps: int = 1,
-    qaoa_shots: int = 256,
-    qaoa_optimizer_iterations: int = 0,
+    qaoa_shots: int = 512,
+    qaoa_optimizer_iterations: int = 20,
 ) -> QuboSolveResult:
     """Dispatch to the selected QUBO backend."""
 
@@ -254,25 +255,40 @@ def assimilate_window_qubo(
     problem: AssimilationProblem,
     block_size: int = 10,
     block_stride: int | None = None,
+    block_selection: BlockSelectionName = "cyclic",
     bits_per_dim: int = 3,
     radius: float = 0.6,
     outer_loops: int = 1,
     seed: int = 0,
     solver: QuboSolverName = "qaoa",
     qaoa_reps: int = 1,
-    qaoa_shots: int = 256,
-    qaoa_optimizer_iterations: int = 0,
+    qaoa_shots: int = 512,
+    qaoa_optimizer_iterations: int = 20,
+    finite_difference_eps: float = 1e-4,
+    verbose: bool = False,
 ) -> WindowAssimilationResult:
     """Optimize one 4D-Var window by sweeping local QUBO increments."""
 
     state = problem.background.copy()
     max_qubo_variables = 0
     rng = np.random.default_rng(seed)
-    block_starts = _block_starts(problem.background.shape[0], block_size, block_stride)
 
-    for _ in range(outer_loops):
-        for start_dim in block_starts:
-            dimensions = tuple(range(start_dim, min(start_dim + block_size, problem.background.shape[0])))
+    for outer_index in range(outer_loops):
+        blocks = _select_dimension_blocks(
+            problem,
+            state,
+            block_size=block_size,
+            block_stride=block_stride,
+            block_selection=block_selection,
+            finite_difference_eps=finite_difference_eps,
+        )
+        for block_number, dimensions in enumerate(blocks, start=1):
+            if verbose:
+                print(
+                    f"[{solver}]   outer {outer_index + 1}/{outer_loops} "
+                    f"block {block_number}/{len(blocks)} selection={block_selection} "
+                    f"dims={_format_dimensions(dimensions)}"
+                )
             current_cost = _classic_window_cost(problem, state)
             qubo = build_incremental_qubo(
                 problem,
@@ -280,6 +296,7 @@ def assimilate_window_qubo(
                 dimensions,
                 bits_per_dim=bits_per_dim,
                 radius=radius,
+                finite_difference_eps=finite_difference_eps,
             )
             max_qubo_variables = max(max_qubo_variables, qubo.n_variables)
             solved = solve_qubo(
@@ -293,8 +310,18 @@ def assimilate_window_qubo(
             selected_dims, increment = decode_increment(qubo, solved.bits)
             candidate = state.copy()
             candidate[list(selected_dims)] += increment
-            if _classic_window_cost(problem, candidate) <= current_cost:
+            candidate_cost = _classic_window_cost(problem, candidate)
+            accepted = candidate_cost <= current_cost
+            if accepted:
                 state = candidate
+            if verbose:
+                status = "accepted" if accepted else "rejected"
+                print(
+                    f"[{solver}]   block {block_number}/{len(blocks)} {status} "
+                    f"dims={_format_dimensions(selected_dims)} "
+                    f"cost={current_cost:.6f}->{candidate_cost:.6f} "
+                    f"qubo_vars={qubo.n_variables}"
+                )
 
     forecast = problem.model.forecast(state, len(problem.observations))
     return WindowAssimilationResult(
@@ -311,20 +338,25 @@ def run_sliding_window_qubo(
     stride: int | None = None,
     block_size: int = 10,
     block_stride: int | None = None,
+    block_selection: BlockSelectionName = "cyclic",
     bits_per_dim: int = 3,
     radius: float = 0.6,
     outer_loops: int = 1,
+    time_sweeps: int = 1,
     background_std: float = 1.0,
     observation_std: float = 0.5,
     seed: int = 0,
     solver: QuboSolverName = "qaoa",
     qaoa_reps: int = 1,
-    qaoa_shots: int = 256,
-    qaoa_optimizer_iterations: int = 0,
+    qaoa_shots: int = 512,
+    qaoa_optimizer_iterations: int = 20,
+    finite_difference_eps: float = 1e-4,
     verbose: bool = True,
 ) -> SlidingAssimilationResult:
     """Run sequential sliding-window Lorenz96 QUBO assimilation over a dataset."""
 
+    if time_sweeps <= 0:
+        raise ValueError("time_sweeps must be positive.")
     if stride is None:
         stride = max(1, window - 1)
     effective_block_stride = block_size if block_stride is None else block_stride
@@ -334,52 +366,64 @@ def run_sliding_window_qubo(
     rng = np.random.default_rng(seed)
     window_starts = list(range(0, dataset.n_times, stride))
 
-    for window_number, start_index in enumerate(window_starts, start=1):
-        local_window = min(window, dataset.n_times - start_index)
-        if local_window <= 0:
-            break
-        window_started = time.perf_counter()
+    for time_sweep in range(time_sweeps):
         if verbose:
-            end_index = start_index + local_window
             print(
-                f"[{solver}] window {window_number}/{len(window_starts)} "
-                f"indices={start_index}..{end_index - 1} start={start_index} length={local_window} "
-                f"block={block_size} block_stride={effective_block_stride} bits={bits_per_dim}"
+                f"[{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
+                f"windows={len(window_starts)}"
             )
+        for window_number, start_index in enumerate(window_starts, start=1):
+            local_window = min(window, dataset.n_times - start_index)
+            if local_window <= 0:
+                break
+            window_started = time.perf_counter()
+            if verbose:
+                end_index = start_index + local_window
+                print(
+                    f"[{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
+                    f"window {window_number}/{len(window_starts)} "
+                    f"indices={start_index}..{end_index - 1} start={start_index} length={local_window} "
+                    f"block={block_size} block_stride={effective_block_stride} "
+                    f"block_selection={block_selection} bits={bits_per_dim}"
+                )
 
-        background = _background_for_window(dataset, analysis, start_index)
-        problem = make_lorenz96_problem(
-            dataset,
-            start_index=start_index,
-            window=local_window,
-            background=background,
-            background_std=background_std,
-            observation_std=observation_std,
-            model=model,
-        )
-        result = assimilate_window_qubo(
-            problem,
-            block_size=block_size,
-            block_stride=block_stride,
-            bits_per_dim=bits_per_dim,
-            radius=radius,
-            outer_loops=outer_loops,
-            seed=int(rng.integers(0, 2**31 - 1)),
-            solver=solver,
-            qaoa_reps=qaoa_reps,
-            qaoa_shots=qaoa_shots,
-            qaoa_optimizer_iterations=qaoa_optimizer_iterations,
-        )
-        end_index = start_index + local_window
-        analysis[start_index:end_index] = result.forecast[:local_window]
-        max_qubo_variables = max(max_qubo_variables, result.max_qubo_variables)
-        if verbose:
-            elapsed = time.perf_counter() - window_started
-            print(
-                f"[{solver}] window {window_number}/{len(window_starts)} done "
-                f"cost={result.window_cost:.6f} max_qubo_vars={result.max_qubo_variables} "
-                f"elapsed={elapsed:.2f}s"
+            background = _background_for_window(dataset, analysis, start_index)
+            problem = make_lorenz96_problem(
+                dataset,
+                start_index=start_index,
+                window=local_window,
+                background=background,
+                background_std=background_std,
+                observation_std=observation_std,
+                model=model,
             )
+            result = assimilate_window_qubo(
+                problem,
+                block_size=block_size,
+                block_stride=block_stride,
+                block_selection=block_selection,
+                bits_per_dim=bits_per_dim,
+                radius=radius,
+                outer_loops=outer_loops,
+                seed=int(rng.integers(0, 2**31 - 1)),
+                solver=solver,
+                qaoa_reps=qaoa_reps,
+                qaoa_shots=qaoa_shots,
+                qaoa_optimizer_iterations=qaoa_optimizer_iterations,
+                finite_difference_eps=finite_difference_eps,
+                verbose=verbose,
+            )
+            end_index = start_index + local_window
+            analysis[start_index:end_index] = result.forecast[:local_window]
+            max_qubo_variables = max(max_qubo_variables, result.max_qubo_variables)
+            if verbose:
+                elapsed = time.perf_counter() - window_started
+                print(
+                    f"[{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
+                    f"window {window_number}/{len(window_starts)} done "
+                    f"cost={result.window_cost:.6f} max_qubo_vars={result.max_qubo_variables} "
+                    f"elapsed={elapsed:.2f}s"
+                )
 
     score = None
     if dataset.has_truth:
@@ -409,6 +453,92 @@ def _finite_difference_tangent(
     return np.column_stack(columns).astype(np.float64)
 
 
+def _select_dimension_blocks(
+    problem: AssimilationProblem,
+    state: Array,
+    block_size: int,
+    block_stride: int | None,
+    block_selection: BlockSelectionName,
+    finite_difference_eps: float,
+) -> list[tuple[int, ...]]:
+    state_dim = int(problem.background.shape[0])
+    if block_selection == "cyclic":
+        return [
+            tuple(range(start, min(start + block_size, state_dim)))
+            for start in _block_starts(state_dim, block_size, block_stride)
+        ]
+
+    max_blocks = len(_block_starts(state_dim, block_size, block_stride))
+    hessian, gradient = _window_quadratic_model(problem, state, finite_difference_eps)
+    if block_selection == "gradient":
+        return _gradient_blocks(gradient, block_size, max_blocks)
+    if block_selection == "hessian":
+        return _hessian_coupled_blocks(hessian, gradient, block_size, max_blocks)
+    raise ValueError(f"Unknown block_selection: {block_selection}.")
+
+
+def _window_quadratic_model(problem: AssimilationProblem, state: Array, finite_difference_eps: float) -> tuple[Array, Array]:
+    dimensions = tuple(range(problem.background.shape[0]))
+    base_trajectory = problem.model.forecast(state, len(problem.observations))
+    residual = (base_trajectory - problem.observations).reshape(-1)
+    tangent = _finite_difference_tangent(problem, state, base_trajectory, dimensions, finite_difference_eps)
+
+    background_precision = 1.0 / float(problem.background_cov[0, 0])
+    observation_precision = 1.0 / float(problem.observation_cov[0, 0])
+    hessian = background_precision * np.eye(len(dimensions), dtype=np.float64)
+    hessian += observation_precision * (tangent.T @ tangent)
+    gradient = background_precision * (state - problem.background)
+    gradient += observation_precision * (tangent.T @ residual)
+    return hessian, gradient
+
+
+def _gradient_blocks(gradient: Array, block_size: int, max_blocks: int) -> list[tuple[int, ...]]:
+    order = np.argsort(-np.abs(gradient))
+    blocks = []
+    used: set[int] = set()
+    for seed in order:
+        if int(seed) in used:
+            continue
+        block = []
+        for dim in order:
+            dim_int = int(dim)
+            if dim_int in used:
+                continue
+            block.append(dim_int)
+            used.add(dim_int)
+            if len(block) == block_size:
+                break
+        if block:
+            blocks.append(tuple(sorted(block)))
+        if len(blocks) >= max_blocks or len(used) == gradient.shape[0]:
+            break
+    return blocks
+
+
+def _hessian_coupled_blocks(hessian: Array, gradient: Array, block_size: int, max_blocks: int) -> list[tuple[int, ...]]:
+    seed_order = np.argsort(-np.abs(gradient))
+    blocks = []
+    used: set[int] = set()
+    all_dims = set(range(gradient.shape[0]))
+
+    for seed in seed_order:
+        seed_int = int(seed)
+        if seed_int in used:
+            continue
+        block = [seed_int]
+        used.add(seed_int)
+        while len(block) < block_size and used != all_dims:
+            candidates = np.asarray(sorted(all_dims - used), dtype=np.int64)
+            coupling = np.sum(np.abs(hessian[np.ix_(candidates, block)]), axis=1)
+            next_dim = int(candidates[int(np.argmax(coupling))])
+            block.append(next_dim)
+            used.add(next_dim)
+        blocks.append(tuple(sorted(block)))
+        if len(blocks) >= max_blocks or used == all_dims:
+            break
+    return blocks
+
+
 def _block_starts(state_dim: int, block_size: int, block_stride: int | None) -> list[int]:
     if block_size <= 0:
         raise ValueError("block_size must be positive.")
@@ -423,6 +553,16 @@ def _block_starts(state_dim: int, block_size: int, block_stride: int | None) -> 
     if starts[-1] != final_start:
         starts.append(final_start)
     return starts
+
+
+def _format_dimensions(dimensions: tuple[int, ...]) -> str:
+    if not dimensions:
+        return "[]"
+    if len(dimensions) == 1:
+        return f"[{dimensions[0]}]"
+    if all(right == left + 1 for left, right in zip(dimensions, dimensions[1:])):
+        return f"[{dimensions[0]}..{dimensions[-1]}]"
+    return "[" + ",".join(str(dim) for dim in dimensions) + "]"
 
 
 def _build_qaoa_circuit(matrix: Array, gammas: Array, betas: Array) -> QuantumCircuit:
@@ -530,6 +670,6 @@ def _classic_window_cost(problem: AssimilationProblem, initial_state: Array) -> 
 
 
 def _background_for_window(dataset: Lorenz96Dataset, analysis: Array, start_index: int) -> Array:
-    if start_index > 0 and np.isfinite(analysis[start_index]).all():
+    if np.isfinite(analysis[start_index]).all():
         return analysis[start_index].copy()
     return dataset.observed[start_index].copy()
