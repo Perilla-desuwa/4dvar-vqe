@@ -1,22 +1,23 @@
-# Quantum-Assisted Toy 4D-Var Demo
+# Quantum-Assisted 4D-Var for Lorenz96
 
-This repository is a minimal runnable template for a quantum hackathon project on
-data assimilation in meteorology and oceanography.
+This repository contains a runnable prototype for the 2026 quantum computing
+data-assimilation challenge. The current main path targets the official
+40-dimensional Lorenz96 dataset and solves a sliding-window incremental 4D-Var
+problem with local QUBO subproblems.
 
-The demo keeps the first version intentionally small but extensible:
+The implementation is intentionally hybrid:
 
-- pluggable forecast models, currently a linear rotation model and Lorenz-63;
-- synthetic observations over a short 4D-Var window;
-- a classical 4D-Var baseline, exact for the linear model and numerical for
-  nonlinear models;
-- a VQE path that discretizes the 4D-Var cost into a diagonal Hamiltonian and
-  searches for a low-cost initial state with Qiskit;
-- a plotting helper for truth, background forecast, and analysis forecast
-  trajectories.
+- Lorenz96 dynamics are integrated with fixed-step RK4.
+- Official long-form CSV files are loaded into dense `time x dimension` arrays.
+- Each 4D-Var window is linearized around the current guess trajectory.
+- A local state increment is encoded as a QUBO with at most 30 binary variables.
+- The default QUBO backend is sampled QAOA on Qiskit Aer; a greedy backend is
+  kept for fast debugging and ablation.
 
-This is not yet a claim that VQE replaces a production adjoint model. It is a
-template for testing the end-to-end story: model forecast, observations,
-classical baseline, quantum optimization hook, and comparable metrics.
+This is a working research prototype rather than a final competition system.
+The quantum part is isolated behind the QUBO solver interface so QAOA settings,
+annealing-style solvers, or a stronger optimizer can be swapped in without
+rewriting the Lorenz96 assimilation loop.
 
 ## Quick Start
 
@@ -25,64 +26,173 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install --upgrade pip
 .\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m pip install -e .
-.\.venv\Scripts\python experiments\run_demo.py
 ```
 
-Run the Lorenz-63 trajectory demo:
+Run the Lorenz96 sliding-window QUBO/QAOA pipeline on the provided small train
+file:
 
 ```powershell
-.\.venv\Scripts\python experiments\run_lorenz63.py
+.\.venv\Scripts\python experiments\run_lorenz96_qubo.py `
+  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --output "outputs\lorenz96_train_qubo_result.csv" `
+  --window 6 `
+  --block-size 10 `
+  --bits-per-dim 3 `
+  --radius 0.4 `
+  --solver qaoa `
+  --qaoa-shots 256
 ```
 
-The Lorenz script writes `outputs/lorenz63_trajectories.png`, comparing the
-true trajectory, the unassimilated background forecast, and the assimilated
-forecast.
+The default full-size configuration uses `10 x 3 = 30` QUBO variables per local
+block, matching the competition qubit limit. On a CPU simulator this can be
+slow, because many sampled QAOA circuits are executed across the sliding
+windows.
 
-Useful knobs:
+For quick debugging, use smaller local QUBOs or the greedy backend:
 
 ```powershell
-.\.venv\Scripts\python experiments\run_demo.py --maxiter 1000
+.\.venv\Scripts\python experiments\run_lorenz96_qubo.py `
+  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --block-size 4 `
+  --bits-per-dim 2 `
+  --solver qaoa `
+  --qaoa-shots 64
+
+.\.venv\Scripts\python experiments\run_lorenz96_qubo.py `
+  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --solver greedy
 ```
 
-Increasing `--bits-per-dim` gives a finer grid but also increases the number of
-qubits and makes the VQE optimization less stable. Keep the default first for a
-smoke test.
+## Visualization
+
+Generate a 2D phase plot for the first two Lorenz96 dimensions. The plot
+contains truth, noisy observations, the unassimilated free run, and the
+assimilated trajectory.
+
+```powershell
+.\.venv\Scripts\python experiments\plot_lorenz96_qubo_phase.py `
+  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --output "outputs\lorenz96_qubo_phase_x0_x1.png" `
+  --limit 120 `
+  --window 6 `
+  --block-size 10 `
+  --bits-per-dim 3 `
+  --radius 0.4 `
+  --solver qaoa
+```
+
+Use `--dim-x` and `--dim-y` to plot other state dimensions.
 
 ## Project Layout
 
 ```text
 src/q4dvar/
-  toy_model.py        model interface, linear model, Lorenz-63, synthetic obs
-  classical_4dvar.py  4D-Var cost, exact linear solve, nonlinear optimizer
-  quantum_vqe.py      grid encoding, diagonal Hamiltonian, VQE solver
-  plotting.py         trajectory comparison plots
+  data_loader.py      official Lorenz96 CSV loader
+  lorenz96.py         Lorenz96 RK4 model and dataset-to-problem builder
+  qubo_4dvar.py       incremental 4D-Var QUBO construction and QAOA backend
+  classical_4dvar.py  classic 4D-Var cost and toy baselines
+  plotting.py         trajectory and phase-space plots
+  toy_model.py        shared model interface plus toy linear/Lorenz-63 models
+  quantum_vqe.py      earlier VQE demo for small toy problems
 experiments/
-  run_demo.py         linear model + VQE smoke test
-  run_lorenz63.py     Lorenz-63 classical 4D-Var trajectory demo
+  run_lorenz96_qubo.py        official-data Lorenz96 QUBO/QAOA run
+  plot_lorenz96_qubo_phase.py Lorenz96 2D trajectory comparison plot
+  run_demo.py                 linear model + VQE smoke test
+  run_lorenz63.py             Lorenz-63 classical 4D-Var trajectory demo
 ```
 
-## Current Mathematical Mapping
+## Data Format
 
-For a linear model and linear observation operator, the toy 4D-Var objective is
+The official CSV format is long-form:
+
+```text
+time_step,dimension,true_value,observed_value
+0,0,...
+0,1,...
+...
+2,0,...
+```
+
+`data_loader.load_lorenz96_csv()` converts it to:
+
+- `time_steps`: sorted observation times.
+- `truth`: shape `(n_times, 40)`, with `NaN` allowed for hidden test truth.
+- `observed`: shape `(n_times, 40)`.
+- `observed_mask`: boolean observation availability mask.
+
+The loader validates required columns, duplicate `(time_step, dimension)` rows,
+dimension bounds, and complete observations.
+
+## Method
+
+The strong-constraint 4D-Var objective over one observation window is:
 
 ```text
 J(x0) = 1/2 ||x0 - xb||^2_B^-1
-      + 1/2 sum_t ||H M_t x0 - y_t||^2_R^-1
+      + 1/2 sum_k ||H M_k(x0) - y_k||^2_R^-1
 ```
 
-The classical baseline solves this quadratic objective directly for the linear
-model. For nonlinear models like Lorenz-63, it minimizes the same 4D-Var cost
-numerically over the initial state.
+For Lorenz96, `H = I`, `R = 0.5^2 I`, and `M_k` is the RK4 forecast operator.
+To obtain a QUBO, the code uses an incremental 4D-Var approximation around the
+current guess `xg`:
 
-The quantum demo samples the objective on a binary grid, expands the resulting
-diagonal energy table as a Pauli-Z Hamiltonian, and uses VQE to find a low-cost
-grid point. The current VQE smoke test is kept on the 2D linear model so it
-stays small enough to run quickly.
+```text
+x0 = xg + delta
+M_k(x0) ~= M_k(xg) + T_k delta
+```
 
-## Next Steps
+After linearization, each local increment block has a quadratic objective:
 
-- Replace synthetic observations with the official dataset loader when it is
-  available.
-- Add a QAOA or quantum annealing-style solver for QUBO-shaped variants.
-- Add a Lorenz-96 model once the baseline interface is stable.
-- Benchmark regular Qiskit Aer against the competition GPU-enabled Aer build.
+```text
+J(delta) = 1/2 delta^T A delta + g^T delta + const
+```
+
+The block increment is discretized with `bits_per_dim` binary variables per
+state dimension, producing a QUBO:
+
+```text
+min_q q^T Q q + const, q in {0, 1}^n
+```
+
+With the default `block_size=10` and `bits_per_dim=3`, each QUBO uses exactly
+30 binary variables. The QAOA backend converts `Q` to Ising `Z` and `ZZ` terms,
+runs a shallow sampled QAOA circuit on Aer, and accepts an increment only if it
+improves the original nonlinear window cost.
+
+## Useful Parameters
+
+- `--window`: number of observation times in one 4D-Var window.
+- `--stride`: step between windows; defaults to `window - 1`.
+- `--block-size`: number of state dimensions optimized per QUBO block.
+- `--bits-per-dim`: binary resolution per state dimension.
+- `--radius`: maximum local increment magnitude encoded by the QUBO grid.
+- `--solver`: `qaoa` for the quantum path, `greedy` for fast debugging.
+- `--qaoa-reps`: QAOA depth `p`.
+- `--qaoa-shots`: shots per sampled QAOA circuit.
+- `--qaoa-optimizer-iterations`: optional COBYLA tuning of QAOA angles. `0`
+  uses fixed angles, which is much faster for end-to-end runs.
+
+## Outputs
+
+`experiments/run_lorenz96_qubo.py` writes a prediction CSV:
+
+```text
+time_step,dimension,predicted_value
+0,0,...
+0,1,...
+```
+
+`experiments/plot_lorenz96_qubo_phase.py` writes a PNG phase plot, usually under
+`outputs/`.
+
+## Legacy Toy Demos
+
+The original toy scripts are still available:
+
+```powershell
+.\.venv\Scripts\python experiments\run_demo.py
+.\.venv\Scripts\python experiments\run_lorenz63.py
+```
+
+They are useful for quick checks of the earlier VQE and classical 4D-Var code,
+but the Lorenz96 QUBO/QAOA path is the competition-oriented implementation.
