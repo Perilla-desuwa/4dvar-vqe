@@ -13,6 +13,8 @@ The implementation is intentionally hybrid:
 - A local state increment is encoded as a QUBO with at most 30 binary variables.
 - The default QUBO backend is sampled QAOA on Qiskit Aer; a greedy backend is
   kept for fast debugging and ablation.
+- An experimental second-order incremental QUBO path is available for small
+  blocks, using auxiliary variables to encode pairwise products.
 
 This is a working research prototype. The quantum part is isolated behind the
 QUBO solver interface so QAOA settings, annealing-style solvers, or a stronger
@@ -31,7 +33,7 @@ Run the Lorenz96 sliding-window QUBO/QAOA pipeline on a local train file:
 
 ```powershell
 .\.venv\Scripts\python runners\run_lorenz96_qubo.py `
-  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --input "\lorenz96_train.csv" `
   --output "outputs\lorenz96_train_qubo_result.csv" `
   --window 6 `
   --block-size 10 `
@@ -60,16 +62,34 @@ For quick debugging, use smaller local QUBOs or the greedy backend:
 
 ```powershell
 .\.venv\Scripts\python runners\run_lorenz96_qubo.py `
-  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --input "\lorenz96_train.csv" `
   --block-size 4 `
   --bits-per-dim 2 `
   --solver qaoa `
   --qaoa-shots 64
 
 .\.venv\Scripts\python runners\run_lorenz96_qubo.py `
-  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --input "\lorenz96_train.csv" `
   --solver greedy
 ```
+
+Run the experimental second-order incremental QUBO path with small blocks:
+
+```powershell
+.\.venv\Scripts\python runners\run_lorenz96_second_order_qubo.py `
+  --input "\lorenz96_train.csv" `
+  --output "outputs\lorenz96_train_second_order_qubo_result.csv" `
+  --window 6 `
+  --block-size 3 `
+  --bits-per-dim 2 `
+  --radius 0.4 `
+  --solver greedy
+```
+
+With `block_size=3` and `bits_per_dim=2`, this uses 6 original increment bits
+and 15 auxiliary product bits, for 21 QUBO variables per local block. Larger
+second-order blocks grow quickly because each pair of original bits needs an
+auxiliary variable.
 
 ## Classical Baselines
 
@@ -100,7 +120,7 @@ assimilated trajectory.
 
 ```powershell
 .\.venv\Scripts\python runners\plot_lorenz96_qubo_phase.py `
-  --input "气象海洋\气象海洋\小规模测试\lorenz96_train.csv" `
+  --input "\lorenz96_train.csv" `
   --output "outputs\lorenz96_qubo_phase_x0_x1.png" `
   --limit 120 `
   --window 6 `
@@ -126,17 +146,20 @@ src/q4dvar/
     classical.py      public wrapper for the classic 4D-Var solver
     baselines.py      observed/free-run/OI/EnKF baselines
     qubo.py           public wrapper for incremental QUBO 4D-Var
+    second_order_qubo.py public wrapper for second-order incremental QUBO 4D-Var
     greedy.py         public wrapper for the greedy QUBO backend
     qaoa.py           public wrapper for the sampled QAOA backend
     vqe.py            public wrapper for the earlier VQE demo
     4dvar/
       classical.py    classic 4D-Var objective and solver
       qubo.py         incremental 4D-Var QUBO construction and dispatcher
+      second_order_qubo.py second-order QUBO construction with auxiliary products
       greedy.py       greedy QUBO backend entry point
       qaoa.py         sampled QAOA QUBO backend entry point
       vqe.py          VQE demo for small toy problems
 runners/
   run_lorenz96_qubo.py        Lorenz96 QUBO/QAOA run
+  run_lorenz96_second_order_qubo.py second-order Lorenz96 QUBO run
   run_lorenz96_baselines.py   classical baseline runner
   generate_lorenz96_dataset.py synthetic Lorenz96 CSV generator
   plot_lorenz96_qubo_phase.py Lorenz96 2D trajectory comparison plot
@@ -202,6 +225,18 @@ With the default `block_size=10` and `bits_per_dim=3`, each QUBO uses exactly
 runs a shallow sampled QAOA circuit on Aer, and accepts an increment only if it
 improves the original nonlinear window cost.
 
+The experimental second-order path replaces the linearized forecast with:
+
+```text
+M_k(xg + delta) ~= M_k(xg) + T_k delta + 1/2 delta^T S_k delta
+```
+
+After binary encoding, the observation residual contains pairwise bit products.
+The code introduces auxiliary variables `p_ij = q_i q_j` and adds a quadratic
+penalty so the lifted problem remains a QUBO. This captures part of the local
+nonlinearity at the cost of many more variables, so it is intended for small
+`block_size` values.
+
 ## Useful Parameters
 
 - `--window`: number of observation times in one 4D-Var window.
@@ -214,11 +249,15 @@ improves the original nonlinear window cost.
 - `--qaoa-shots`: shots per sampled QAOA circuit.
 - `--qaoa-optimizer-iterations`: optional COBYLA tuning of QAOA angles. `0`
   uses fixed angles, which is much faster for end-to-end runs.
+- `--penalty-strength`: second-order runner only; enforces auxiliary
+  `p_ij = q_i q_j` consistency.
+- `--finite-difference-eps`: second-order runner only; step size for estimating
+  first- and second-order trajectory sensitivities.
 
 ## Outputs
 
-`runners/run_lorenz96_qubo.py` and `runners/run_lorenz96_baselines.py`
-write prediction CSVs:
+`runners/run_lorenz96_qubo.py`, `runners/run_lorenz96_second_order_qubo.py`,
+and `runners/run_lorenz96_baselines.py` write prediction CSVs:
 
 ```text
 time_step,dimension,predicted_value

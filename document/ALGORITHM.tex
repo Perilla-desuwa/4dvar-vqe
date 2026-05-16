@@ -1,0 +1,565 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{left=2.6cm,right=2.6cm,top=2.6cm,bottom=2.6cm}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\lstdefinestyle{cmd}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!6},
+  columns=fullflexible
+}
+
+\title{Lorenz96 的量子辅助增量 4D-Var 方法说明}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文档说明一种面向 Lorenz96 系统的量子辅助数据同化方法。数据同化的核心任务是在不完美模型与不完整观测之间进行动态一致的最优融合；本文采用滚动窗口强约束 4D-Var 建模该问题，并将局部状态增量转化为小规模 QUBO 子问题。方法上不直接量子化完整高维非线性轨迹，而是通过短时间窗口、增量近似、状态维度分块和非线性代价检验，将量子优化限制在变量数可控的局部子问题中，并提供 Greedy 与 QAOA 两类 QUBO 求解后端。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{概述}
+
+数据同化是数值天气预报、海洋预报和复杂动力系统估计中的基础问题。实际系统状态无法被直接、完整、无噪声地获得：数值模型提供了满足物理方程的背景预报，但会受到离散化、参数化、初值误差和混沌敏感性的影响；观测资料提供了对真实系统的直接约束，但往往存在噪声、缺测、时间不连续和空间分布不均匀等问题。因此，同化算法需要在两类信息之间建立桥梁：既不能完全相信会随时间漂移的模型，也不能简单拼接带噪且不完整的观测，而是要寻找一个与动力学相容、同时尽可能解释观测的分析场。
+
+从统计角度看，数据同化可以理解为贝叶斯估计：背景预报给出先验分布，观测资料提供似然信息，分析场对应后验分布的代表状态。从优化角度看，它也可以写成一个带权最小二乘问题：背景项约束分析场不要偏离短期预报，观测项约束模型轨迹贴近观测。本文采用的 4D-Var 属于后一类变分同化方法，其特点是在一个时间窗口内同时利用多时刻观测，并通过预报模型约束整条轨迹。
+
+近年来，量子计算被广泛探索为求解经典优化问题的新型计算范式。量子退火、QAOA 等方法并不是直接替代动力学模型本身，而是将组合优化问题表示为 Ising 哈密顿量或 QUBO 形式，再利用量子隧穿、叠加态采样或变分量子线路在离散搜索空间中寻找低能量解。数据同化中的变分问题天然具有优化结构：4D-Var 需要反复降低代价函数，且在强非线性动力系统中可能出现多个局部极小值。已有研究尝试将 4D-Var 近似并改写为 QUBO，使其能够由量子退火机求解，并在 Lorenz96 等低维混沌模型上验证了量子数据同化的可行性~\cite{kotsuki2024quantum}；也有工作进一步结合二阶增量方法与量子退火，在 Lorenz63 实验中降低了陷入局部极小值的频率~\cite{tsuyuki2025secondorder}。这些研究说明，量子算法更适合作为经典同化框架中的局部优化模块，而不是一次性承载完整的高维非线性同化问题。由此引出的核心工程问题是：如何在有限量子比特数下，把 4D-Var 中最关键、最适合离散优化的部分压缩成可执行的小规模 QUBO 子问题。
+
+本文实现了一种面向 Lorenz96 系统的混合数据同化方法。整体框架由三部分组成：
+
+\begin{enumerate}
+  \item 使用 Lorenz96 方程与四阶 Runge--Kutta 方法构造非线性预报模型；
+  \item 在滚动时间窗口内构造强约束 4D-Var 目标函数，并在当前初猜轨迹附近做增量线性化；
+  \item 将局部状态增量离散成 QUBO 子问题，并使用 Greedy 或 QAOA 后端求解。
+\end{enumerate}
+
+该设计遵循以下约束：
+
+\begin{itemize}
+  \item 预报模型必须保留 Lorenz96 的非线性动力学；
+  \item 优化问题应利用一个时间窗口内的多时刻观测，而不是只做单时刻去噪；
+  \item 每次 QUBO/量子线路调用都必须控制在固定变量预算内，默认最多使用 30 个二进制变量。
+\end{itemize}
+
+当前代码还包含若干经典参考方法：直接观测、自由积分、最优插值/OI 和随机 EnKF。这些 baseline 用于评估 QUBO 辅助同化相对简单经典方法的收益。
+
+从算法定位上看，本方法并不试图将完整的高维非线性同化问题一次性量子化。对于 Lorenz96 这类混沌动力系统，完整时间域上的非线性目标函数既高维又强非凸，直接编码会导致量子比特数、线路深度和优化难度同时失控。因此，本文采用“经典动力学外循环 + 局部量子优化子问题”的分解策略：经典部分负责模型传播、窗口管理和非线性代价检验；量子部分只处理由局部线性化得到的小规模二次优化问题。
+
+这种设计有两个实际优点。第一，它保留了 4D-Var 对模型动力学一致性的利用，不会退化为逐时刻的观测平滑。第二，它使每次量子线路调用的规模可控，可以通过 \texttt{block\_size}、\texttt{bits\_per\_dim} 和 \texttt{block\_stride} 明确控制变量数，从而满足固定量子比特预算下的运行要求。
+
+\section{问题描述}
+\subsection{大气与海洋科学中的数据同化问题}
+
+在大气和海洋数值预报中，系统状态通常是高维、非线性且随时间快速演化的。即使预报模型基于明确的物理定律构建，也必须对真实过程进行离散化和参数化；云微物理、边界层湍流、海气交换等过程无法被完全解析，初始条件中的微小误差还会在混沌动力学下迅速放大。另一方面，观测系统也并不完美。卫星、雷达、地面站和海洋浮标提供了宝贵信息，但观测误差、仪器偏差、时间采样间隔和空间覆盖不均匀不可避免。
+
+因此，数据同化要解决的并不是“模型和观测谁更可信”的二选一问题，而是如何按误差统计和动力学约束融合两者。背景预报提供了空间连续、动力学一致的先验轨迹，观测资料提供了对真实状态的校正信息。同化的目标是生成一个分析场，使它在统计意义上接近真实状态，并且在动力学意义上能够作为后续预报的可靠初值。
+
+抽象地说，数据同化问题可以描述为：
+
+\begin{equation}
+  \min_{\bm{x}_0} J(\bm{x}_0),
+\end{equation}
+
+其中 $J(\bm{x}_0)$ 是目标函数，$\bm{x}_0$ 是初始状态。
+
+在本文使用的 Lorenz96 设置中，观测算子为单位阵，即每个观测时刻都观测完整状态向量。但即使在全状态观测的情况下，同化问题仍然不是简单的逐点去噪。原因在于 Lorenz96 是非线性混沌系统：如果只在每个时刻独立拟合观测，得到的序列未必对应任何一条由模型方程生成的物理轨迹。4D-Var 的意义正在于把多个时刻的观测统一放入一个时间窗口中，通过动力学模型约束整条轨迹。
+
+因此，本文关注的问题不是单时刻估计
+\begin{equation}
+  \bm{x}_k \approx \bm{y}_k,
+\end{equation}
+而是寻找窗口初始状态 $\bm{x}_0$，使得由 $\bm{x}_0$ 出发的模型轨迹在整个窗口内同时贴近观测。
+
+\subsection{经典同化算法与量子优化动机}
+
+经典数据同化大致可以分为两条路线。第一类是以 3D-Var 和 4D-Var 为代表的变分同化。3D-Var 在单一时刻寻找最优分析场，可以理解为对系统状态拍摄一张静态照片；4D-Var 则把时间维度纳入目标函数，在一个连续窗口内寻找最优初始状态，使得由该初始状态驱动得到的整条模型轨迹同时拟合窗口内的观测。后一种方法更能利用动力学约束，但目标函数通常更高维、更非线性，传统实现还常依赖切线模型和伴随模型。
+
+第二类是以 EnKF 为代表的序贯同化。EnKF 通过一组集合样本表示背景误差协方差，并随着观测到达逐步更新系统状态。它避免了显式伴随模型，适合在线循环更新，但需要足够大的集合规模来刻画误差统计；当系统非线性强、集合规模有限或误差分布明显非高斯时，集合退化、采样误差和局部化选择都会影响结果。
+
+量子优化方法的切入点在于变分同化中的优化子问题。4D-Var 的完整目标函数可能包含多个局部极小值，直接用梯度法或局部搜索可能依赖初值；而量子退火、QAOA 等方法天然面向组合优化或 Ising/QUBO 形式，适合在离散搜索空间中寻找低能量状态。本文并不假设当前量子模拟器可以直接处理完整 40 维、长窗口、强非线性的同化问题，而是将 4D-Var 写成一系列局部增量 QUBO：经典部分负责模型传播和误差建模，量子部分负责在受控变量数内搜索局部状态修正。这样既保留了变分同化的动力学含义，也为量子优化提供了明确、可执行的任务接口。
+
+\subsection{四维变分方法}
+
+在一个同化窗口内，强约束 4D-Var 优化窗口初始状态 $\bm{x}_0$，使得由该初始状态经模型传播得到的轨迹尽可能贴近窗口内所有观测。目标函数为
+\begin{equation}
+  J(\bm{x}_0)
+  =
+  \frac{1}{2}
+  \left\|
+    \bm{x}_0 - \bm{x}_b
+  \right\|_{B^{-1}}^2
+  +
+  \frac{1}{2}
+  \sum_{k \in \mathcal{W}}
+  \left\|
+    M_k(\bm{x}_0) - \bm{y}_k
+  \right\|_{R^{-1}}^2 .
+  \label{eq:4dvar}
+\end{equation}
+
+其中：
+\begin{itemize}
+  \item $\bm{x}_0$ 是当前窗口内待优化的初始状态；
+  \item $\bm{x}_b$ 是背景场；
+  \item $M_k$ 是从窗口初始时刻传播到第 $k$ 个观测时刻的 Lorenz96 RK4 预报算子；
+  \item $\bm{y}_k$ 是第 $k$ 个观测时刻的观测值；
+  \item $B$ 和 $R$ 分别为背景误差协方差矩阵和观测误差协方差矩阵。
+\end{itemize}
+
+当前实现使用对角协方差：
+\begin{equation}
+  B = \sigma_b^2 I,
+  \qquad
+  R = \sigma_{\mathrm{obs}}^2 I.
+\end{equation}
+
+其中 $B$ 控制背景场对最终分析场的约束强度，$R$ 控制观测项在目标函数中的权重。当 $\sigma_{\mathrm{obs}}$ 较小时，算法更信任观测；当 $\sigma_b$ 较小时，算法更倾向于保持背景状态。当前实现采用简单的标量方差形式，主要是为了保持 QUBO 构造清晰，并减少额外调参对结果解释的干扰。
+
+需要强调的是，本文采用的是强约束 4D-Var，即假设窗口内部模型本身没有显式模型误差项。所有轨迹都由同一个初始状态经 Lorenz96 模型确定。这一假设简化了优化变量，也使得量子子问题可以集中在窗口初始状态增量上。
+
+
+\subsection{Lorenz96 动力学模型}
+
+系统状态记为
+\begin{equation}
+  \bm{x}(t) = \left[x_0(t), x_1(t), \ldots, x_{d-1}(t)\right]^\top ,
+\end{equation}
+其中 $d$ 是状态维度，可在数据生成脚本中配置。
+
+Lorenz96 动力学方程为
+\begin{equation}
+  \frac{d x_i}{dt}
+  =
+  \left(x_{i+1} - x_{i-2}\right)x_{i-1}
+  - x_i + F,
+  \quad i = 0,\ldots,d-1,
+\end{equation}
+并采用循环边界条件。默认强迫项为 $F=8$。
+
+代码中使用四阶 Runge--Kutta 方法进行数值积分：
+\begin{equation}
+  \bm{x}_{k+1} = \mathrm{RK4}(\bm{x}_k, \Delta t).
+\end{equation}
+
+观测模型为全状态带噪观测：
+\begin{equation}
+  \bm{y}_k = \bm{x}_k + \bm{\epsilon}_k,
+  \quad
+  \bm{\epsilon}_k \sim \mathcal{N}(0, \sigma_{\mathrm{obs}}^2 I).
+\end{equation}
+默认观测噪声标准差为 $\sigma_{\mathrm{obs}} = 0.5$。
+
+Lorenz96 模型虽然形式简洁，但具有典型的非线性耦合与混沌敏感性。每个维度 $x_i$ 的演化依赖其邻近分量 $x_{i-2}$、$x_{i-1}$ 和 $x_{i+1}$，因此在状态维度上具有局部耦合结构。这一点也是本文采用重叠 block 优化的动机之一：如果硬性把状态维度切成互不重叠的块，可能会割裂相邻变量之间的动力联系；而使用 \texttt{block\_stride < block\_size} 的重叠 block，可以在不增加单次 QUBO 变量数的情况下缓解这一问题。
+
+此外，Lorenz96 的混沌特性也限制了同化窗口长度。窗口过短时，算法利用的时间信息不足；窗口过长时，当前轨迹附近的线性化会迅速失效。因此本文采用滚动短窗口策略，并通过 \texttt{window} 与 \texttt{stride} 控制时间方向的局部性和重叠程度。
+
+
+\section{算法原理}
+\subsection{4D Var目标函数的增量线性化}
+
+直接将式~\eqref{eq:4dvar} 的完整非线性优化问题编码为 QUBO 并不现实。因此，算法采用增量 4D-Var 思路，在当前初猜轨迹附近做局部线性化。
+
+设
+\begin{equation}
+  \bm{x}_0 = \bm{x}_g + \bm{\delta},
+\end{equation}
+其中 $\bm{x}_g$ 是当前初猜状态，$\bm{\delta}$ 是待求增量。
+
+在短时间窗口内，模型轨迹近似为
+\begin{equation}
+  M_k(\bm{x}_g + \bm{\delta})
+  \approx
+  M_k(\bm{x}_g) + T_k \bm{\delta},
+\end{equation}
+其中 $T_k$ 是切线传播矩阵。代码中使用有限差分近似 $T_k$。
+
+代入 4D-Var 目标函数后，可以得到关于 $\bm{\delta}$ 的二次近似：
+\begin{equation}
+  J(\bm{\delta})
+  =
+  \frac{1}{2}
+  \bm{\delta}^{\top} A \bm{\delta}
+  +
+  \bm{g}^{\top}\bm{\delta}
+  + \mathrm{const}.
+  \label{eq:incremental}
+\end{equation}
+
+式~\eqref{eq:incremental} 是从 4D-Var 过渡到 QUBO 的关键。
+
+在具体实现中，切线传播矩阵 $T_k$ 没有显式推导伴随模型或切线模型，而是采用有限差分近似。对于当前正在优化的局部 block 中每个维度，算法对初始状态施加一个很小扰动，重新运行 Lorenz96 预报，并用扰动前后的轨迹差分估计该维度对窗口内所有观测时刻的影响。这样做的优点是实现简单、模型无关；缺点是计算量会随 block 大小和窗口长度线性增加。因此，block 大小和窗口长度都需要控制在合理范围内。
+
+增量线性化还有一个重要前提：候选增量不能太大。代码通过 \texttt{radius} 限制每个维度增量的离散搜索范围。如果 \texttt{radius} 过小，算法可能无法从较差初猜中恢复；如果 \texttt{radius} 过大，线性化近似可能不再可靠。因此该参数在大规模实验中需要与 \texttt{window}、\texttt{bits\_per\_dim} 配合调节。
+
+\subsection{局部 Block QUBO 编码}
+
+完整状态维度可能远大于单次量子线路可承载的变量数。因此，算法不一次优化全部维度，而是按状态维度 block 局部优化。
+
+对于一个维度集合 $S$，仅编码局部增量 $\bm{\delta}_S$。若每个状态维度使用 $b$ 个二进制变量，则单次 QUBO 的变量数为
+\begin{equation}
+  n_{\mathrm{qubits}} = |S| \cdot b
+  =
+  \mathrm{block\_size} \cdot \mathrm{bits\_per\_dim}.
+\end{equation}
+
+默认完整配置为
+\begin{equation}
+  \mathrm{block\_size}=10,
+  \qquad
+  \mathrm{bits\_per\_dim}=3,
+  \qquad
+  n_{\mathrm{qubits}}=30.
+\end{equation}
+
+每个连续增量被映射到一个二进制网格：
+\begin{equation}
+  \delta_i
+  =
+  \mathrm{offset}_i
+  +
+  \sum_j w_j q_{ij},
+  \qquad
+  q_{ij} \in \{0,1\}.
+\end{equation}
+
+将该编码代入二次目标函数后得到标准 QUBO：
+\begin{equation}
+  \min_{\bm{q} \in \{0,1\}^n}
+  \bm{q}^{\top} Q \bm{q} + \mathrm{const}.
+  \label{eq:qubo}
+\end{equation}
+
+由于 QUBO 后续会映射为 Ising 哈密顿量或由离散优化器直接处理，所有连续自由度都必须通过二进制变量表示。本文采用均匀网格编码：每个状态维度在区间 $[-r,r]$ 内取 $2^b$ 个离散水平，其中 $r$ 对应代码中的 \texttt{radius}，$b$ 对应 \texttt{bits\_per\_dim}。因此，提高 \texttt{bits\_per\_dim} 可以提升局部增量分辨率，但也会线性增加单次 QUBO 变量数。
+
+在 30 变量预算下，\texttt{block\_size} 与 \texttt{bits\_per\_dim} 存在直接权衡。例如：
+\begin{equation}
+  10 \times 3 = 30,
+  \qquad
+  15 \times 2 = 30,
+  \qquad
+  6 \times 5 = 30.
+\end{equation}
+前者在维度覆盖和离散精度之间较平衡；第二种覆盖更多维度但每维精度较粗；第三种每维精度更高但一次只能优化较少维度。当前默认采用 $10 \times 3$ 的配置。
+
+\subsection{二阶增量 QUBO 实验分支}
+
+线性增量方法只保留了模型传播算子的一阶项。当窗口较长、初猜误差较大或 Lorenz96 的局部非线性较强时，一阶近似可能低估轨迹对初始扰动的弯曲响应。受二阶增量 4D-Var 与量子退火结合思路的启发~\cite{tsuyuki2025secondorder}，我们进一步实现了二阶增量的 4D-Var 方法。
+
+二阶近似写作
+\begin{equation}
+  M_k(\bm{x}_g + \bm{\delta})
+  \approx
+  M_k(\bm{x}_g)
+  + T_k \bm{\delta}
+  + \frac{1}{2}
+  \bm{\delta}^{\top} S_k \bm{\delta},
+\end{equation}
+其中 $S_k$ 表示模型传播对窗口初始状态的二阶敏感性。当前实现同样采用有限差分估计：一阶项使用中心差分，二阶对角项使用二阶中心差分，混合项使用四点中心差分。
+
+将二阶近似代入观测残差后，残差中会出现二进制变量乘积 $q_i q_j$。如果直接平方残差，目标函数会包含四次二进制项，不能直接交给 QUBO 后端。因此实现中引入辅助变量
+\begin{equation}
+  p_{ij} = q_i q_j,
+  \qquad i < j,
+\end{equation}
+并加入二次惩罚项
+\begin{equation}
+  \lambda
+  \left(
+    3p_{ij} + q_i q_j - 2q_i p_{ij} - 2q_j p_{ij}
+  \right),
+\end{equation}
+使得只有 $p_{ij}=q_iq_j$ 时惩罚为零。这样，二阶残差平方可以在扩展变量 $(\bm{q},\bm{p})$ 上重新写成 QUBO。
+
+该方法的代价是变量数增长很快。若原始增量编码使用 $n$ 个 bit，则辅助变量数为 $n(n-1)/2$，总变量数为
+\begin{equation}
+  n_{\mathrm{total}}
+  =
+  n + \frac{n(n-1)}{2}.
+\end{equation}
+因此二阶分支默认使用 \texttt{block\_size=3}、\texttt{bits\_per\_dim=2}，即 $n=6$，总变量数为 $21$，仍在 30 变量预算内。该分支主要用于实验比较，不替代默认的一阶增量 QUBO 主流程。
+
+\subsection{时间窗口}
+
+算法中有两类局部性：
+
+\begin{itemize}
+  \item \textbf{window}：时间方向局部性，控制一次 4D-Var 目标函数包含多少个观测时刻；
+  \item \textbf{block}：状态维度方向局部性，控制一次 QUBO 优化多少个状态维度。
+\end{itemize}
+
+对每一个时间窗口，算法流程为：
+\begin{lstlisting}[style=cmd]
+for outer_loop in 1..N:
+    for each state block:
+        build local QUBO
+        solve QUBO
+        decode increment
+        accept increment only if nonlinear window cost decreases
+\end{lstlisting}
+
+其中 \texttt{block\_stride} 可以小于 \texttt{block\_size}，从而产生重叠 block。例如：
+\begin{equation}
+  \mathrm{block\_size}=10,
+  \qquad
+  \mathrm{block\_stride}=5,
+\end{equation}
+对应的 block 为
+\begin{equation}
+  0..9,\quad 5..14,\quad 10..19,\quad \ldots
+\end{equation}
+
+重叠 block 可以减轻硬切分状态维度带来的边界效应，也更适合 Lorenz96 这类局部耦合系统。
+
+时间窗口的作用是引入动力学一致性。若不使用窗口，而只在单个时刻拟合观测，则目标函数主要退化为对观测噪声的平滑，无法保证所得状态序列由 Lorenz96 方程产生。使用窗口后，算法优化的是窗口初始状态，后续所有时刻的状态都由模型传播得到，因此窗口内整条轨迹需要同时解释多时刻观测。
+
+窗口长度不能无限增大。对于混沌系统，长窗口会导致两个问题：其一，初始扰动会随时间快速放大，使线性化近似失效；其二，有限差分构造 QUBO 时需要在整个窗口上重复预报，计算量随窗口长度增加。实践中更合理的策略是采用中短窗口，并通过窗口重叠提高时间覆盖。例如 \texttt{window=8, stride=4} 表示每个窗口包含 8 个观测时刻，相邻窗口重叠 4 个时刻。
+
+当前实现中，窗口结果会写入对应的分析场区间；若窗口重叠，后一个窗口会覆盖重叠位置。后续可以进一步改进为重叠区域加权平均，以减少窗口边界处的不连续。
+
+\subsection{优化维度选择}
+
+优化维度选择由 \texttt{block\_size} 和 \texttt{block\_stride} 控制。设状态维度为 $d$，每个 block 覆盖 \texttt{block\_size} 个连续维度。若 \texttt{block\_stride = block\_size}，则不同 block 互不重叠；若 \texttt{block\_stride < block\_size}，则相邻 block 发生重叠。
+
+例如，当 $d=40$、\texttt{block\_size=10}、\texttt{block\_stride=10} 时，维度划分为：
+\begin{equation}
+  0..9,\quad 10..19,\quad 20..29,\quad 30..39.
+\end{equation}
+这是最简单的不重叠 block-coordinate 优化。
+
+当 \texttt{block\_stride=5} 时，维度划分变为：
+\begin{equation}
+  0..9,\quad 5..14,\quad 10..19,\quad 15..24,\quad \ldots
+\end{equation}
+此时每个内部维度会在多个 block 中被重复优化。对于 Lorenz96 这种邻域耦合模型，重叠 block 通常更自然，因为某个维度的变化会通过动力学项影响其相邻维度。重叠 block 不会增加单次 QUBO 的变量数，但会增加一个窗口内 QUBO 子问题的数量。
+
+当前实现还支持 \texttt{outer\_loops}，即在同一个时间窗口内反复 sweep 所有 block。这样做相当于 block-coordinate descent 的多轮迭代：第一轮得到粗略修正，后续轮次在更新后的状态附近继续修正。一般来说，\texttt{outer\_loops=2} 或 3 可能带来收益，但计算量也会相应增加。
+
+综合来看，优化维度选择需要在以下三者之间平衡：
+\begin{itemize}
+  \item 单次 QUBO 变量数：由 \texttt{block\_size} 和 \texttt{bits\_per\_dim} 决定；
+  \item 状态耦合覆盖：由 \texttt{block\_stride} 决定；
+  \item 计算时间：由 block 数量、窗口数和 \texttt{outer\_loops} 共同决定。
+\end{itemize}
+
+\subsection{QAOA 后端}
+
+QAOA 后端会将 QUBO 转换为 Ising 哈密顿量。对二进制变量 $q_i$，使用映射
+\begin{equation}
+  q_i = \frac{1 - z_i}{2}.
+\end{equation}
+
+代价哈密顿量可写为
+\begin{equation}
+  H_C
+  =
+  \sum_i h_i Z_i
+  +
+  \sum_{i<j} J_{ij} Z_i Z_j.
+\end{equation}
+
+QAOA 电路在代价演化和混合演化之间交替：
+\begin{equation}
+  U_C(\gamma) = \exp(-i\gamma H_C),
+  \qquad
+  U_M(\beta) = \exp\left(-i\beta \sum_i X_i\right).
+\end{equation}
+
+初态为均匀叠加态：
+\begin{equation}
+  |+\rangle^{\otimes n}.
+\end{equation}
+
+经过 $p$ 层 QAOA 后：
+\begin{equation}
+  |\psi\rangle
+  =
+  \prod_{\ell=1}^{p}
+  U_M(\beta_{\ell})
+  U_C(\gamma_{\ell})
+  |+\rangle^{\otimes n}.
+\end{equation}
+
+实现中使用 Qiskit Aer 对线路采样，并从采样得到的 bitstring 中选择 QUBO 能量最低的解。代码也支持用 COBYLA 调整 QAOA 角度；不过在端到端大规模实验中，固定浅层角度通常更快。
+
+\subsection{非线性代价接受准则}
+
+由于 QUBO 来自局部线性化，QUBO 最优解不能无条件接受。解码出候选增量后，算法会重新计算原始非线性 4D-Var 窗口代价。
+
+只有当
+\begin{equation}
+  J_{\mathrm{nonlinear}}(\mathrm{candidate})
+  \le
+  J_{\mathrm{nonlinear}}(\mathrm{current})
+\end{equation}
+时，才接受该 block 的更新。
+
+该规则类似 trust-region 保护，可以避免线性化误差导致轨迹变差。
+
+\section{经典 Baseline}
+
+项目中包含四类经典参考方法：
+
+\begin{itemize}
+  \item \texttt{observed}：直接使用带噪观测作为分析场；
+  \item \texttt{free\_run}：从第一个观测值出发自由积分，不再吸收后续观测；
+  \item \texttt{optimal\_interpolation}：标量增益的 3D-Var/OI cycling；
+  \item \texttt{stochastic\_enkf}：全状态随机 EnKF。
+\end{itemize}
+
+这些 baseline 用于区分“单纯观测去噪”和“利用动力学一致性”的效果差异。
+
+\section{示例结果}
+
+在一个 40 维 Lorenz96 数据集上，取前 120 个观测时刻，曾得到如下代表性 RMSE：
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lc}
+    \toprule
+    方法 & RMSE \\
+    \midrule
+    初始自由积分 & 4.363070 \\
+    OI baseline & 0.409237 \\
+    Greedy QUBO & 0.189511 \\
+    \bottomrule
+  \end{tabular}
+  \caption{示例 RMSE 对比}
+\end{table}
+
+示例二维相图路径为：
+\begin{lstlisting}[style=cmd]
+outputs/lorenz96_baseline_solver_x0_x1.png
+\end{lstlisting}
+
+若该图片存在，可以在最终版本中插入：
+\begin{figure}[h]
+  \centering
+  \IfFileExists{outputs/lorenz96_baseline_solver_x0_x1.png}{
+    \includegraphics[width=0.82\linewidth]{outputs/lorenz96_baseline_solver_x0_x1.png}
+  }{
+    \fbox{\parbox{0.75\linewidth}{未找到示例图片：outputs/lorenz96\_baseline\_solver\_x0\_x1.png}}
+  }
+  \caption{真实轨迹、初始自由积分、经典 baseline 与 QUBO 辅助分析轨迹的二维相图对比}
+\end{figure}
+
+\section{复现实验}
+
+安装依赖：
+\begin{lstlisting}[style=cmd]
+python -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python -m pip install -e .
+\end{lstlisting}
+
+生成合成数据集：
+\begin{lstlisting}[style=cmd]
+.\.venv\Scripts\python runners\generate_lorenz96_dataset.py `
+  --output "outputs\datasets\lorenz96_dim80_t200.csv" `
+  --state-dim 80 `
+  --n-times 200 `
+  --steps-per-obs 2 `
+  --obs-std 0.5
+\end{lstlisting}
+
+运行 Greedy QUBO 4D-Var：
+\begin{lstlisting}[style=cmd]
+.\.venv\Scripts\python runners\run_lorenz96_qubo.py `
+  --input "outputs\datasets\lorenz96_dim80_t200.csv" `
+  --output "outputs\lorenz96_dim80_t200_greedy.csv" `
+  --window 8 `
+  --stride 4 `
+  --block-size 10 `
+  --block-stride 5 `
+  --bits-per-dim 3 `
+  --radius 0.4 `
+  --solver greedy
+\end{lstlisting}
+
+运行采样式 QAOA：
+\begin{lstlisting}[style=cmd]
+.\.venv\Scripts\python runners\run_lorenz96_qubo.py `
+  --input "outputs\datasets\lorenz96_dim80_t200.csv" `
+  --output "outputs\lorenz96_dim80_t200_qaoa.csv" `
+  --window 8 `
+  --stride 4 `
+  --block-size 10 `
+  --block-stride 5 `
+  --bits-per-dim 3 `
+  --radius 0.4 `
+  --solver qaoa `
+  --qaoa-reps 1 `
+  --qaoa-shots 256
+\end{lstlisting}
+
+生成对比图：
+\begin{lstlisting}[style=cmd]
+.\.venv\Scripts\python runners\plot_lorenz96_baseline_compare.py `
+  --input "outputs\datasets\lorenz96_dim80_t200.csv" `
+  --output "outputs\lorenz96_dim80_t200_compare.png" `
+  --limit 120 `
+  --baseline observed `
+  --solver greedy `
+  --window 8 `
+  --stride 4 `
+  --block-size 10 `
+  --block-stride 5 `
+  --bits-per-dim 3
+\end{lstlisting}
+
+\section{总结}
+
+本方法可以概括为一种量子辅助增量 4D-Var：
+
+\begin{itemize}
+  \item Lorenz96 提供非线性动力学约束；
+  \item 滚动时间窗口保证线性化近似在局部时间内有效；
+  \item 局部 block QUBO 保证每次量子调用不超过变量预算；
+  \item QAOA 提供基于量子线路的 QUBO 求解路径；
+  \item Greedy QUBO 提供快速可扩展的对照后端；
+  \item 非线性代价接受准则避免线性化代理问题产生有害更新。
+\end{itemize}
+
+核心思想不是把完整高维非线性轨迹一次性塞进一个量子线路，而是把数据同化问题拆成许多小规模、局部、具有动力学意义的 QUBO 子问题。
+
+\begin{thebibliography}{9}
+
+\bibitem{kotsuki2024quantum}
+S. Kotsuki, F. Kawasaki, and M. Ohashi.
+\newblock Quantum data assimilation: a new approach to solving data assimilation on quantum annealers.
+\newblock \emph{Nonlinear Processes in Geophysics}, 31, 237--245, 2024.
+\newblock doi: \href{https://doi.org/10.5194/npg-31-237-2024}{10.5194/npg-31-237-2024}.
+
+\bibitem{tsuyuki2025secondorder}
+T. Tsuyuki, F. Kawasaki, and S. Kotsuki.
+\newblock Four-dimensional variational data assimilation using the second-order incremental approach and quantum annealing.
+\newblock \emph{Journal of the Meteorological Society of Japan}, 103(5), 629--647, 2025.
+\newblock doi: \href{https://doi.org/10.2151/jmsj.2025-032}{10.2151/jmsj.2025-032}.
+
+\end{thebibliography}
+
+\end{document}
