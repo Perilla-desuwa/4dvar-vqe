@@ -49,6 +49,12 @@ def main() -> None:
     parser.add_argument("--radius", type=float, default=0.4, help="Maximum absolute increment per dimension.")
     parser.add_argument("--block-passes", type=int, default=5, help="Number of QUBO block sweep passes per window.")
     parser.add_argument("--time-sweeps", type=int, default=3, help="Number of full passes over all time windows.")
+    parser.add_argument(
+        "--time-sweep-mode",
+        choices=["carry", "background"],
+        default="carry",
+        help="How later time sweeps initialize each window.",
+    )
     parser.add_argument("--ensemble-size", type=int, default=80, help="EnKF ensemble size if --baseline enkf.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--quiet", action="store_true", help="Disable per-window progress logs.")
@@ -75,6 +81,7 @@ def main() -> None:
         radius=args.radius,
         outer_loops=args.block_passes,
         time_sweeps=args.time_sweeps,
+        time_sweep_mode=args.time_sweep_mode,
         seed=args.seed,
         solver=args.solver,
         verbose=not args.quiet,

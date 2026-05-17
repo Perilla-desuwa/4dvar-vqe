@@ -17,6 +17,7 @@ from q4dvar.solvers.classical import rmse
 
 QuboSolverName = Literal["greedy", "qaoa"]
 BlockSelectionName = Literal["cyclic", "gradient", "hessian"]
+TimeSweepMode = Literal["carry", "background"]
 
 
 @dataclass(frozen=True)
@@ -343,6 +344,7 @@ def run_sliding_window_qubo(
     radius: float = 0.6,
     outer_loops: int = 1,
     time_sweeps: int = 1,
+    time_sweep_mode: TimeSweepMode = "carry",
     background_std: float = 1.0,
     observation_std: float = 0.5,
     seed: int = 0,
@@ -357,6 +359,8 @@ def run_sliding_window_qubo(
 
     if time_sweeps <= 0:
         raise ValueError("time_sweeps must be positive.")
+    if time_sweep_mode not in ("carry", "background"):
+        raise ValueError("time_sweep_mode must be 'carry' or 'background'.")
     if stride is None:
         stride = max(1, window - 1)
     effective_block_stride = block_size if block_stride is None else block_stride
@@ -365,12 +369,13 @@ def run_sliding_window_qubo(
     max_qubo_variables = 0
     rng = np.random.default_rng(seed)
     window_starts = list(range(0, dataset.n_times, stride))
+    carried_backgrounds: dict[int, Array] = {}
 
     for time_sweep in range(time_sweeps):
         if verbose:
             print(
                 f"[{solver}] time_sweep {time_sweep + 1}/{time_sweeps} "
-                f"windows={len(window_starts)}"
+                f"windows={len(window_starts)} mode={time_sweep_mode}"
             )
         for window_number, start_index in enumerate(window_starts, start=1):
             local_window = min(window, dataset.n_times - start_index)
@@ -384,10 +389,14 @@ def run_sliding_window_qubo(
                     f"window {window_number}/{len(window_starts)} "
                     f"indices={start_index}..{end_index - 1} start={start_index} length={local_window} "
                     f"block={block_size} block_stride={effective_block_stride} "
-                    f"block_selection={block_selection} bits={bits_per_dim}"
+                    f"block_selection={block_selection} bits={bits_per_dim} "
+                    f"mode={time_sweep_mode}"
                 )
 
-            background = _background_for_window(dataset, analysis, start_index)
+            if time_sweep_mode == "carry" and start_index in carried_backgrounds:
+                background = carried_backgrounds[start_index].copy()
+            else:
+                background = _background_for_window(dataset, analysis, start_index)
             problem = make_lorenz96_problem(
                 dataset,
                 start_index=start_index,
@@ -415,6 +424,8 @@ def run_sliding_window_qubo(
             )
             end_index = start_index + local_window
             analysis[start_index:end_index] = result.forecast[:local_window]
+            if time_sweep_mode == "carry":
+                carried_backgrounds[start_index] = result.initial_state.copy()
             max_qubo_variables = max(max_qubo_variables, result.max_qubo_variables)
             if verbose:
                 elapsed = time.perf_counter() - window_started
@@ -468,7 +479,10 @@ def _select_dimension_blocks(
             for start in _block_starts(state_dim, block_size, block_stride)
         ]
 
-    max_blocks = len(_block_starts(state_dim, block_size, block_stride))
+    # Adaptive policies choose one active block from the current linearized
+    # window. Multiple active blocks are obtained by increasing outer_loops so
+    # each loop can re-linearize around the updated state.
+    max_blocks = 1
     hessian, gradient = _window_quadratic_model(problem, state, finite_difference_eps)
     if block_selection == "gradient":
         return _gradient_blocks(gradient, block_size, max_blocks)

@@ -30,6 +30,12 @@ def main() -> None:
     parser.add_argument("--radius", type=float, default=0.6, help="Maximum absolute increment per dimension.")
     parser.add_argument("--outer-loops", type=int, default=1, help="Number of QUBO block sweep passes per window.")
     parser.add_argument("--time-sweeps", type=int, default=3, help="Number of full passes over all time windows.")
+    parser.add_argument(
+        "--time-sweep-mode",
+        choices=["carry", "background"],
+        default="carry",
+        help="How later time sweeps initialize each window.",
+    )
     parser.add_argument("--solver", choices=["qaoa", "greedy"], default="qaoa", help="QUBO backend.")
     parser.add_argument("--qaoa-reps", type=int, default=1, help="QAOA depth p.")
     parser.add_argument("--qaoa-shots", type=int, default=512, help="Shots per QAOA circuit.")
@@ -55,6 +61,7 @@ def main() -> None:
         radius=args.radius,
         outer_loops=args.outer_loops,
         time_sweeps=args.time_sweeps,
+        time_sweep_mode=args.time_sweep_mode,
         seed=args.seed,
         solver=args.solver,
         qaoa_reps=args.qaoa_reps,
@@ -70,7 +77,7 @@ def main() -> None:
     print(f"output:             {args.output}")
     print(f"states:             {result.analysis.shape}")
     print(f"window/stride:      {args.window}/{args.stride or max(1, args.window - 1)}")
-    print(f"time sweeps:        {args.time_sweeps}")
+    print(f"time sweeps/mode:   {args.time_sweeps}/{args.time_sweep_mode}")
     print(f"block/stride/bits:  {args.block_size}/{args.block_stride or args.block_size}/{args.bits_per_dim}")
     print(f"block selection:    {args.block_selection}")
     print(f"solver:             {args.solver}")

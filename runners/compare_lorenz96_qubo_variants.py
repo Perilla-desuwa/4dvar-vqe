@@ -31,7 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare Lorenz96 QUBO variants and block-selection policies.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_PATH, help="Lorenz96 CSV file.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for PNG outputs.")
-    parser.add_argument("--limit", type=int, default=120, help="Number of observation times to use for comparison.")
+    parser.add_argument("--limit", type=int, default=120, help="Number of observation times to show in trajectory plots.")
     parser.add_argument("--dim-x", type=int, default=0, help="X-axis state dimension for phase plots.")
     parser.add_argument("--dim-y", type=int, default=1, help="Y-axis state dimension for phase plots.")
     parser.add_argument("--window", type=int, default=6, help="Number of observation times per 4D-Var window.")
@@ -47,8 +47,14 @@ def main() -> None:
         help="Binary variables per dimension for the linear vs second-order comparison.",
     )
     parser.add_argument("--radius", type=float, default=0.4, help="Maximum absolute increment per dimension.")
-    parser.add_argument("--outer-loops", type=int, default=4, help="Number of QUBO block sweep passes per window.")
+    parser.add_argument("--outer-loops", type=int, default=12, help="Number of QUBO block sweep passes per window.")
     parser.add_argument("--time-sweeps", type=int, default=3, help="Number of full passes over all time windows.")
+    parser.add_argument(
+        "--time-sweep-mode",
+        choices=["carry", "background"],
+        default="carry",
+        help="How later time sweeps initialize each window.",
+    )
     parser.add_argument("--solver", choices=["greedy", "qaoa"], default="greedy", help="QUBO backend.")
     parser.add_argument("--qaoa-reps", type=int, default=1, help="QAOA depth p.")
     parser.add_argument("--qaoa-shots", type=int, default=512, help="Shots per QAOA circuit.")
@@ -57,11 +63,24 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     args = parser.parse_args()
 
-    dataset = _slice_dataset(load_lorenz96_csv(args.input), args.limit)
+    dataset = load_lorenz96_csv(args.input)
+    plot_dataset = _slice_dataset(dataset, args.limit)
     model = Lorenz96Model(state_dim=dataset.state_dim)
     initial = model.forecast(dataset.observed[0], dataset.n_times)
-    order_note = _parameter_note(args, dataset, bits_per_dim=args.order_bits_per_dim, label="linear/2nd-order")
-    block_note = _parameter_note(args, dataset, bits_per_dim=args.bits_per_dim, label="block selection")
+    order_note = _parameter_note(
+        args,
+        dataset,
+        bits_per_dim=args.order_bits_per_dim,
+        label="linear/2nd-order",
+        plot_points=plot_dataset.n_times,
+    )
+    block_note = _parameter_note(
+        args,
+        dataset,
+        bits_per_dim=args.bits_per_dim,
+        label="block selection",
+        plot_points=plot_dataset.n_times,
+    )
 
     linear = _run_linear(
         "linear QUBO",
@@ -84,7 +103,7 @@ def main() -> None:
     block_energy = args.output_dir / "lorenz96_test_1_block_selection_energy.png"
 
     _plot_phase(
-        dataset,
+        plot_dataset,
         {"initial": initial, linear.name: linear.analysis, second_order.name: second_order.analysis},
         linear_traj,
         dims=(args.dim_x, args.dim_y),
@@ -98,7 +117,7 @@ def main() -> None:
         parameter_note=order_note,
     )
     _plot_phase(
-        dataset,
+        plot_dataset,
         {result.name: result.analysis for result in block_results},
         block_traj,
         dims=(args.dim_x, args.dim_y),
@@ -110,7 +129,8 @@ def main() -> None:
     print("Lorenz96 QUBO variant comparison")
     print("=" * 38)
     print(f"input:                     {args.input}")
-    print(f"points/state_dim:          {dataset.n_times}/{dataset.state_dim}")
+    print(f"metric points/state_dim:   {dataset.n_times}/{dataset.state_dim}")
+    print(f"plot points:               {plot_dataset.n_times}")
     print(f"solver:                    {args.solver}")
     print(f"linear vs second-order:    {linear_traj}")
     print(f"linear metric bars:        {linear_energy}")
@@ -138,6 +158,7 @@ def _run_linear(
         radius=args.radius,
         outer_loops=args.outer_loops,
         time_sweeps=args.time_sweeps,
+        time_sweep_mode=args.time_sweep_mode,
         seed=args.seed,
         solver=args.solver,
         qaoa_reps=args.qaoa_reps,
@@ -160,6 +181,7 @@ def _run_second_order(name: str, dataset: Lorenz96Dataset, args: argparse.Namesp
         radius=args.radius,
         outer_loops=args.outer_loops,
         time_sweeps=args.time_sweeps,
+        time_sweep_mode=args.time_sweep_mode,
         seed=args.seed,
         solver=args.solver,
         qaoa_reps=args.qaoa_reps,
@@ -190,6 +212,7 @@ def _plot_phase(
     parameter_note: str,
 ) -> None:
     x_dim, y_dim = dims
+    n_points = dataset.n_times
     figure, axis = plt.subplots(figsize=(8.5, 7.0))
     axis.plot(dataset.truth[:, x_dim], dataset.truth[:, y_dim], label="truth", color="black", linewidth=2.2)
     axis.scatter(
@@ -208,7 +231,7 @@ def _plot_phase(
         {"color": "tab:purple", "linestyle": ":", "linewidth": 2.1},
     ]
     for style, (label, values) in zip(styles, trajectories.items()):
-        axis.plot(values[:, x_dim], values[:, y_dim], label=label, **style)
+        axis.plot(values[:n_points, x_dim], values[:n_points, y_dim], label=label, **style)
 
     axis.set_xlabel(f"x{int(x_dim)}")
     axis.set_ylabel(f"x{int(y_dim)}")
@@ -251,15 +274,21 @@ def _plot_metric_bars(results: list[MethodResult], output_path: Path, title: str
     plt.close(figure)
 
 
-def _parameter_note(args: argparse.Namespace, dataset: Lorenz96Dataset, bits_per_dim: int, label: str) -> str:
+def _parameter_note(
+    args: argparse.Namespace,
+    dataset: Lorenz96Dataset,
+    bits_per_dim: int,
+    label: str,
+    plot_points: int,
+) -> str:
     stride = args.stride if args.stride is not None else max(1, args.window - 1)
     block_stride = args.block_stride if args.block_stride is not None else args.block_size
     return (
-        f"data={Path(args.input).name}, points={dataset.n_times}, dim={dataset.state_dim}, "
+        f"data={Path(args.input).name}, metric_points={dataset.n_times}, plot_points={plot_points}, dim={dataset.state_dim}, "
         f"test={label}, solver={args.solver}, window/stride={args.window}/{stride}\n"
         f"block/stride={args.block_size}/{block_stride}, second-order block={args.second_order_block_size}, "
         f"bits={bits_per_dim}, radius={args.radius}, outer_loops={args.outer_loops}, "
-        f"time_sweeps={args.time_sweeps}"
+        f"time_sweeps={args.time_sweeps}, mode={args.time_sweep_mode}"
     )
 
 
